@@ -62,10 +62,22 @@ class CheckoutResponse(BaseModel):
     session_id: str
 
 
+class TrialStatus(BaseModel):
+    is_trial_active: bool
+    trial_started_at: Optional[datetime] = None
+    trial_expires_at: Optional[datetime] = None
+    trial_days_remaining: Optional[float] = None
+
+
 class SubscriptionStatus(BaseModel):
     is_active: bool
     expires_at: Optional[datetime] = None
     device_id: str
+    # Trial info
+    is_trial: bool = False
+    trial_info: Optional[TrialStatus] = None
+    # Status message for UI
+    status_message: str = ""
 
 
 class PaymentTransaction(BaseModel):
@@ -353,23 +365,87 @@ async def get_payment_status(session_id: str, http_request: Request):
 
 @api_router.get("/subscription/status/{device_id}", response_model=SubscriptionStatus)
 async def get_subscription_status(device_id: str):
-    """Check if a device has an active subscription."""
+    """Check if a device has an active subscription or trial."""
+    # Check for paid subscription first
     subscription = await db.subscriptions.find_one({"device_id": device_id})
     
-    if not subscription:
+    if subscription:
+        expires_at = subscription.get("expires_at")
+        is_active = expires_at and expires_at > datetime.utcnow() if expires_at else False
+        
+        if is_active:
+            return SubscriptionStatus(
+                is_active=True,
+                expires_at=expires_at,
+                device_id=device_id,
+                is_trial=False,
+                status_message="Premium subscriber"
+            )
+    
+    # Check for trial
+    trial = await db.trials.find_one({"device_id": device_id})
+    
+    if not trial:
+        # New user - start trial
+        trial_started = datetime.utcnow()
+        trial_expires = trial_started + timedelta(days=3)
+        
+        await db.trials.insert_one({
+            "device_id": device_id,
+            "trial_started_at": trial_started,
+            "trial_expires_at": trial_expires,
+            "created_at": datetime.utcnow()
+        })
+        
         return SubscriptionStatus(
-            is_active=False,
-            device_id=device_id
+            is_active=True,
+            expires_at=trial_expires,
+            device_id=device_id,
+            is_trial=True,
+            trial_info=TrialStatus(
+                is_trial_active=True,
+                trial_started_at=trial_started,
+                trial_expires_at=trial_expires,
+                trial_days_remaining=3.0
+            ),
+            status_message="3-day free trial started!"
         )
     
-    # Check if subscription is still valid
-    expires_at = subscription.get("expires_at")
-    is_active = expires_at and expires_at > datetime.utcnow() if expires_at else False
+    # Existing trial - check if still valid
+    trial_expires = trial.get("trial_expires_at")
+    trial_started = trial.get("trial_started_at")
     
+    if trial_expires and trial_expires > datetime.utcnow():
+        # Trial still active
+        time_remaining = trial_expires - datetime.utcnow()
+        days_remaining = time_remaining.total_seconds() / (24 * 60 * 60)
+        
+        return SubscriptionStatus(
+            is_active=True,
+            expires_at=trial_expires,
+            device_id=device_id,
+            is_trial=True,
+            trial_info=TrialStatus(
+                is_trial_active=True,
+                trial_started_at=trial_started,
+                trial_expires_at=trial_expires,
+                trial_days_remaining=round(days_remaining, 2)
+            ),
+            status_message=f"Trial: {round(days_remaining, 1)} days left"
+        )
+    
+    # Trial expired, no subscription
     return SubscriptionStatus(
-        is_active=is_active,
-        expires_at=expires_at,
-        device_id=device_id
+        is_active=False,
+        device_id=device_id,
+        is_trial=False,
+        trial_info=TrialStatus(
+            is_trial_active=False,
+            trial_started_at=trial_started,
+            trial_expires_at=trial_expires,
+            trial_days_remaining=0
+        ),
+        status_message="Trial expired - Subscribe to continue"
     )
 
 
