@@ -102,10 +102,10 @@
 # Testing Data - Main Agent and testing sub agent both should log testing data below this section
 #====================================================================================================
 
-user_problem_statement: "Build an app that allows the user to input the size and angle of a ramp, as well as the gap needing to be cleared and the weight of their dirt bike and their body weight in order to quickly get an estimated speed needed to clear the gap"
+user_problem_statement: "Build an app that allows the user to input the size and angle of a ramp, as well as the gap needing to be cleared and the weight of their dirt bike and their body weight in order to quickly get an estimated speed needed to clear the gap. Enhanced with visual trajectory animation, save/share calculations, and map view for locations."
 
 backend:
-  - task: "Jump Calculation API Endpoint"
+  - task: "Jump Calculation API with Trajectory Points"
     implemented: true
     working: true
     file: "/app/backend/server.py"
@@ -115,22 +115,46 @@ backend:
     status_history:
       - working: true
         agent: "main"
-        comment: "Implemented POST /api/calculate-jump endpoint with physics-based projectile motion calculations. Tested with curl - returns correct speed calculations (29.39 mph for 50ft gap at 30 degrees)"
+        comment: "POST /api/calculate-jump now returns 51 trajectory points for animation. Tested with curl."
 
-  - task: "Calculation History API"
+  - task: "Save Calculation API"
     implemented: true
     working: true
     file: "/app/backend/server.py"
     stuck_count: 0
-    priority: "low"
+    priority: "high"
     needs_retesting: false
     status_history:
       - working: true
         agent: "main"
-        comment: "Implemented GET /api/calculation-history and DELETE /api/calculation-history endpoints for storing/retrieving past calculations"
+        comment: "POST /api/save-calculation saves with optional location and generates share code. GET /api/saved-calculations retrieves all saved."
+
+  - task: "Share Calculation API"
+    implemented: true
+    working: true
+    file: "/app/backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "POST /api/share-calculation/{id} generates 8-char share code. GET /api/shared/{code} retrieves shared calculation."
+
+  - task: "Map Locations API"
+    implemented: true
+    working: true
+    file: "/app/backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "GET /api/map-locations returns all saved calculations with location data for map display."
 
 frontend:
-  - task: "Jump Calculator UI"
+  - task: "Jump Calculator UI with Trajectory Animation"
     implemented: true
     working: true
     file: "/app/frontend/app/index.tsx"
@@ -140,22 +164,57 @@ frontend:
     status_history:
       - working: true
         agent: "main"
-        comment: "Built complete calculator UI with input fields for ramp angle, gap distance, bike weight, rider weight, optional ramp height and landing height. Imperial/Metric toggle. Results display shows required speed, safety speed (+15%), flight time, max height, landing velocity, total weight, and safety warnings."
+        comment: "Calculator tab with SVG trajectory visualization, animated bike path, replay button, save/share buttons in results section."
+
+  - task: "Saved Calculations Screen"
+    implemented: true
+    working: true
+    file: "/app/frontend/app/saved.tsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "Saved tab shows all saved calculations with share badges, view/share/delete actions, and share code lookup functionality."
+
+  - task: "Map Screen for Jump Locations"
+    implemented: true
+    working: true
+    file: "/app/frontend/app/map.tsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "Map tab with SVG-based map visualization showing saved/shared locations with zoom controls, legend, and location details."
+
+  - task: "Tab Navigation"
+    implemented: true
+    working: true
+    file: "/app/frontend/app/_layout.tsx"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "Bottom tab navigation with Calculator, Saved, and Map tabs. Icons and styling working correctly."
 
 metadata:
   created_by: "main_agent"
-  version: "1.0"
-  test_sequence: 1
+  version: "2.0"
+  test_sequence: 2
   run_ui: false
 
 test_plan:
   current_focus:
-    - "Jump Calculation API Endpoint"
-    - "Jump Calculator UI"
+    - "All features working"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
 
 agent_communication:
   - agent: "main"
-    message: "MVP completed - Dirt Bike Jump Calculator app is functional. Backend API calculates required speed using projectile motion physics. Frontend provides clean mobile UI with all required inputs and detailed results display."
+    message: "Enhanced features complete - Trajectory animation, save/share calculations with share codes, and map view for saved locations with interactive SVG visualization."
