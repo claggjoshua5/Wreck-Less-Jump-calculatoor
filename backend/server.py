@@ -244,18 +244,15 @@ def generate_share_code() -> str:
 
 @api_router.post("/payments/create-checkout", response_model=CheckoutResponse)
 async def create_checkout_session(request: CreateCheckoutRequest, http_request: Request):
-    """Create a Stripe checkout session for monthly subscription."""
+    """Create a Stripe checkout session for monthly subscription (no trial)."""
     try:
-        # Initialize Stripe
         host_url = request.origin_url.rstrip('/')
         webhook_url = f"{host_url}/api/webhook/stripe"
         stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
         
-        # Create success and cancel URLs
         success_url = f"{host_url}/payment-success?session_id={{CHECKOUT_SESSION_ID}}"
         cancel_url = f"{host_url}/payment-cancel"
         
-        # Create checkout session with fixed $2.00 amount
         checkout_request = CheckoutSessionRequest(
             amount=SUBSCRIPTION_PRICE,
             currency="usd",
@@ -264,13 +261,13 @@ async def create_checkout_session(request: CreateCheckoutRequest, http_request: 
             metadata={
                 "device_id": request.device_id,
                 "subscription_type": "monthly",
-                "product": "dirt_bike_jump_calculator"
+                "product": "dirt_bike_jump_calculator",
+                "has_trial": "false"
             }
         )
         
         session = await stripe_checkout.create_checkout_session(checkout_request)
         
-        # Create payment transaction record
         transaction = PaymentTransaction(
             session_id=session.session_id,
             device_id=request.device_id,
@@ -290,54 +287,115 @@ async def create_checkout_session(request: CreateCheckoutRequest, http_request: 
         raise HTTPException(status_code=500, detail=f"Failed to create checkout: {str(e)}")
 
 
+@api_router.post("/payments/start-trial", response_model=CheckoutResponse)
+async def create_trial_checkout_session(request: CreateCheckoutRequest, http_request: Request):
+    """Create a Stripe checkout session with 3-day free trial."""
+    try:
+        host_url = request.origin_url.rstrip('/')
+        webhook_url = f"{host_url}/api/webhook/stripe"
+        stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
+        
+        success_url = f"{host_url}/payment-success?session_id={{CHECKOUT_SESSION_ID}}&trial=true"
+        cancel_url = f"{host_url}/payment-cancel"
+        
+        # Create checkout with trial - user enters card but isn't charged for 3 days
+        checkout_request = CheckoutSessionRequest(
+            amount=SUBSCRIPTION_PRICE,
+            currency="usd",
+            success_url=success_url,
+            cancel_url=cancel_url,
+            metadata={
+                "device_id": request.device_id,
+                "subscription_type": "monthly_with_trial",
+                "product": "dirt_bike_jump_calculator",
+                "has_trial": "true",
+                "trial_days": "3"
+            }
+        )
+        
+        session = await stripe_checkout.create_checkout_session(checkout_request)
+        
+        transaction = PaymentTransaction(
+            session_id=session.session_id,
+            device_id=request.device_id,
+            amount=0,  # Trial starts at $0
+            currency="usd",
+            status="pending",
+            payment_status="pending"
+        )
+        await db.payment_transactions.insert_one(transaction.dict())
+        
+        return CheckoutResponse(
+            checkout_url=session.url,
+            session_id=session.session_id
+        )
+    except Exception as e:
+        logging.error(f"Error creating trial checkout session: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create trial checkout: {str(e)}")
+
+
 @api_router.get("/payments/status/{session_id}")
 async def get_payment_status(session_id: str, http_request: Request):
     """Check the status of a payment session."""
     try:
-        # Get the origin from referer or use a default
         origin = str(http_request.base_url).rstrip('/')
         webhook_url = f"{origin}/api/webhook/stripe"
         stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
         
-        # Get status from Stripe
         checkout_status = await stripe_checkout.get_checkout_status(session_id)
         
-        # Get transaction from database
         transaction = await db.payment_transactions.find_one({"session_id": session_id})
         
         if not transaction:
             raise HTTPException(status_code=404, detail="Transaction not found")
         
-        # Update transaction status if payment is completed
-        if checkout_status.payment_status == "paid" and transaction.get("status") != "completed":
-            # Calculate subscription expiry (30 days from now)
-            expires_at = datetime.utcnow() + timedelta(days=30)
-            
-            await db.payment_transactions.update_one(
-                {"session_id": session_id},
-                {
-                    "$set": {
-                        "status": "completed",
-                        "payment_status": "paid",
-                        "updated_at": datetime.utcnow(),
-                        "subscription_expires_at": expires_at
+        # Check if this is a trial or regular payment
+        is_trial = transaction.get("amount", 0) == 0
+        
+        if checkout_status.payment_status == "paid" or (is_trial and checkout_status.status == "complete"):
+            if transaction.get("status") != "completed":
+                # Calculate subscription and trial dates
+                now = datetime.utcnow()
+                
+                if is_trial:
+                    # Trial: 3 days free, then monthly
+                    trial_ends_at = now + timedelta(days=3)
+                    subscription_expires_at = now + timedelta(days=33)  # 3 day trial + 30 day subscription
+                else:
+                    # Direct subscription: 30 days
+                    trial_ends_at = None
+                    subscription_expires_at = now + timedelta(days=30)
+                
+                await db.payment_transactions.update_one(
+                    {"session_id": session_id},
+                    {
+                        "$set": {
+                            "status": "completed",
+                            "payment_status": "paid",
+                            "updated_at": now,
+                            "subscription_expires_at": subscription_expires_at
+                        }
                     }
+                )
+                
+                # Create/update subscription record
+                subscription_data = {
+                    "is_active": True,
+                    "expires_at": subscription_expires_at,
+                    "updated_at": now,
+                    "last_payment_session": session_id,
+                    "is_trial": is_trial,
                 }
-            )
-            
-            # Also update/create subscription record
-            await db.subscriptions.update_one(
-                {"device_id": transaction["device_id"]},
-                {
-                    "$set": {
-                        "is_active": True,
-                        "expires_at": expires_at,
-                        "updated_at": datetime.utcnow(),
-                        "last_payment_session": session_id
-                    }
-                },
-                upsert=True
-            )
+                
+                if is_trial:
+                    subscription_data["trial_started_at"] = now
+                    subscription_data["trial_ends_at"] = trial_ends_at
+                
+                await db.subscriptions.update_one(
+                    {"device_id": transaction["device_id"]},
+                    {"$set": subscription_data},
+                    upsert=True
+                )
         elif checkout_status.status == "expired":
             await db.payment_transactions.update_one(
                 {"session_id": session_id},
@@ -353,8 +411,9 @@ async def get_payment_status(session_id: str, http_request: Request):
         return {
             "status": checkout_status.status,
             "payment_status": checkout_status.payment_status,
-            "amount": checkout_status.amount_total / 100,  # Convert cents to dollars
-            "currency": checkout_status.currency
+            "amount": checkout_status.amount_total / 100 if checkout_status.amount_total else 0,
+            "currency": checkout_status.currency,
+            "is_trial": is_trial
         }
     except HTTPException:
         raise
@@ -371,9 +430,39 @@ async def get_subscription_status(device_id: str):
     
     if subscription:
         expires_at = subscription.get("expires_at")
+        is_trial = subscription.get("is_trial", False)
+        trial_ends_at = subscription.get("trial_ends_at")
         is_active = expires_at and expires_at > datetime.utcnow() if expires_at else False
         
         if is_active:
+            # Check if still in trial period
+            if is_trial and trial_ends_at:
+                if trial_ends_at > datetime.utcnow():
+                    time_remaining = trial_ends_at - datetime.utcnow()
+                    days_remaining = time_remaining.total_seconds() / (24 * 60 * 60)
+                    return SubscriptionStatus(
+                        is_active=True,
+                        expires_at=trial_ends_at,
+                        device_id=device_id,
+                        is_trial=True,
+                        trial_info=TrialStatus(
+                            is_trial_active=True,
+                            trial_started_at=subscription.get("trial_started_at"),
+                            trial_expires_at=trial_ends_at,
+                            trial_days_remaining=round(days_remaining, 2)
+                        ),
+                        status_message=f"Trial: {round(days_remaining, 1)} days left"
+                    )
+                else:
+                    # Trial ended, now on paid subscription
+                    return SubscriptionStatus(
+                        is_active=True,
+                        expires_at=expires_at,
+                        device_id=device_id,
+                        is_trial=False,
+                        status_message="Premium subscriber"
+                    )
+            
             return SubscriptionStatus(
                 is_active=True,
                 expires_at=expires_at,
@@ -382,70 +471,13 @@ async def get_subscription_status(device_id: str):
                 status_message="Premium subscriber"
             )
     
-    # Check for trial
-    trial = await db.trials.find_one({"device_id": device_id})
-    
-    if not trial:
-        # New user - start trial
-        trial_started = datetime.utcnow()
-        trial_expires = trial_started + timedelta(days=3)
-        
-        await db.trials.insert_one({
-            "device_id": device_id,
-            "trial_started_at": trial_started,
-            "trial_expires_at": trial_expires,
-            "created_at": datetime.utcnow()
-        })
-        
-        return SubscriptionStatus(
-            is_active=True,
-            expires_at=trial_expires,
-            device_id=device_id,
-            is_trial=True,
-            trial_info=TrialStatus(
-                is_trial_active=True,
-                trial_started_at=trial_started,
-                trial_expires_at=trial_expires,
-                trial_days_remaining=3.0
-            ),
-            status_message="3-day free trial started!"
-        )
-    
-    # Existing trial - check if still valid
-    trial_expires = trial.get("trial_expires_at")
-    trial_started = trial.get("trial_started_at")
-    
-    if trial_expires and trial_expires > datetime.utcnow():
-        # Trial still active
-        time_remaining = trial_expires - datetime.utcnow()
-        days_remaining = time_remaining.total_seconds() / (24 * 60 * 60)
-        
-        return SubscriptionStatus(
-            is_active=True,
-            expires_at=trial_expires,
-            device_id=device_id,
-            is_trial=True,
-            trial_info=TrialStatus(
-                is_trial_active=True,
-                trial_started_at=trial_started,
-                trial_expires_at=trial_expires,
-                trial_days_remaining=round(days_remaining, 2)
-            ),
-            status_message=f"Trial: {round(days_remaining, 1)} days left"
-        )
-    
-    # Trial expired, no subscription
+    # No subscription - user needs to start trial with credit card
     return SubscriptionStatus(
         is_active=False,
         device_id=device_id,
         is_trial=False,
-        trial_info=TrialStatus(
-            is_trial_active=False,
-            trial_started_at=trial_started,
-            trial_expires_at=trial_expires,
-            trial_days_remaining=0
-        ),
-        status_message="Trial expired - Subscribe to continue"
+        trial_info=None,
+        status_message="Start your 3-day free trial"
     )
 
 
