@@ -1,63 +1,83 @@
-import React from 'react';
-import { Tabs } from 'expo-router';
-import { Ionicons } from '@expo/vector-icons';
-import { Platform } from 'react-native';
+import React, { useState, useEffect, createContext, useContext } from 'react';
+import { Stack } from 'expo-router';
+import * as Device from 'expo-constants';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
-// Tab bar icon components defined outside of render
-const CalculatorIcon = ({ color, size }: { color: string; size: number }) => (
-  <Ionicons name="calculator" size={size} color={color} />
-);
+const EXPO_PUBLIC_BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL;
 
-const SavedIcon = ({ color, size }: { color: string; size: number }) => (
-  <Ionicons name="bookmark" size={size} color={color} />
-);
+interface SubscriptionContextType {
+  isSubscribed: boolean;
+  isLoading: boolean;
+  deviceId: string;
+  checkSubscription: () => Promise<void>;
+  setSubscribed: (value: boolean) => void;
+}
 
-const MapIcon = ({ color, size }: { color: string; size: number }) => (
-  <Ionicons name="map" size={size} color={color} />
-);
+export const SubscriptionContext = createContext<SubscriptionContextType>({
+  isSubscribed: false,
+  isLoading: true,
+  deviceId: '',
+  checkSubscription: async () => {},
+  setSubscribed: () => {},
+});
 
-export default function TabLayout() {
+export const useSubscription = () => useContext(SubscriptionContext);
+
+// Generate or retrieve device ID
+const getDeviceId = async (): Promise<string> => {
+  let deviceId = await AsyncStorage.getItem('device_id');
+  if (!deviceId) {
+    // Generate a unique device ID
+    deviceId = `device_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
+    await AsyncStorage.setItem('device_id', deviceId);
+  }
+  return deviceId;
+};
+
+export default function RootLayout() {
+  const [isSubscribed, setIsSubscribed] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [deviceId, setDeviceId] = useState('');
+
+  const checkSubscription = async () => {
+    try {
+      const id = await getDeviceId();
+      setDeviceId(id);
+      
+      const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/subscription/status/${id}`);
+      if (response.ok) {
+        const data = await response.json();
+        setIsSubscribed(data.is_active);
+      }
+    } catch (error) {
+      console.error('Error checking subscription:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    checkSubscription();
+  }, []);
+
+  const setSubscribed = (value: boolean) => {
+    setIsSubscribed(value);
+  };
+
   return (
-    <Tabs
-      screenOptions={{
-        headerShown: false,
-        tabBarStyle: {
-          backgroundColor: '#1A1A1A',
-          borderTopColor: '#333',
-          borderTopWidth: 1,
-          paddingBottom: Platform.OS === 'ios' ? 20 : 8,
-          paddingTop: 8,
-          height: Platform.OS === 'ios' ? 85 : 65,
-        },
-        tabBarActiveTintColor: '#FF6B35',
-        tabBarInactiveTintColor: '#888',
-        tabBarLabelStyle: {
-          fontSize: 12,
-          fontWeight: '600',
-        },
-      }}
-    >
-      <Tabs.Screen
-        name="index"
-        options={{
-          title: 'Calculator',
-          tabBarIcon: CalculatorIcon,
-        }}
-      />
-      <Tabs.Screen
-        name="saved"
-        options={{
-          title: 'Saved',
-          tabBarIcon: SavedIcon,
-        }}
-      />
-      <Tabs.Screen
-        name="map"
-        options={{
-          title: 'Map',
-          tabBarIcon: MapIcon,
-        }}
-      />
-    </Tabs>
+    <SubscriptionContext.Provider value={{ 
+      isSubscribed, 
+      isLoading, 
+      deviceId, 
+      checkSubscription,
+      setSubscribed 
+    }}>
+      <Stack screenOptions={{ headerShown: false }}>
+        <Stack.Screen name="(tabs)" />
+        <Stack.Screen name="paywall" />
+        <Stack.Screen name="payment-success" />
+        <Stack.Screen name="payment-cancel" />
+      </Stack>
+    </SubscriptionContext.Provider>
   );
 }

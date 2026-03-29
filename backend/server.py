@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException, Request
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -6,19 +6,26 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Dict
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 import math
 
-
+# Load environment variables
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
+
+# Import Stripe integration
+from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
+
+# Stripe configuration
+STRIPE_API_KEY = os.environ.get('STRIPE_API_KEY')
+SUBSCRIPTION_PRICE = 2.00  # $2.00 monthly subscription
 
 # Create the main app without a prefix
 app = FastAPI()
@@ -42,6 +49,36 @@ class LocationData(BaseModel):
     latitude: float
     longitude: float
     address: Optional[str] = None
+
+
+# Payment Models
+class CreateCheckoutRequest(BaseModel):
+    origin_url: str
+    device_id: str
+
+
+class CheckoutResponse(BaseModel):
+    checkout_url: str
+    session_id: str
+
+
+class SubscriptionStatus(BaseModel):
+    is_active: bool
+    expires_at: Optional[datetime] = None
+    device_id: str
+
+
+class PaymentTransaction(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    session_id: str
+    device_id: str
+    amount: float
+    currency: str
+    status: str  # 'pending', 'completed', 'failed', 'expired'
+    payment_status: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    subscription_expires_at: Optional[datetime] = None
 
 
 # Jump Calculation Models
@@ -117,7 +154,6 @@ def generate_trajectory_points(
     cos_theta = math.cos(theta_rad)
     sin_theta = math.sin(theta_rad)
     
-    # Calculate total flight time
     vx = v_fps * cos_theta
     vy = v_fps * sin_theta
     
@@ -126,7 +162,6 @@ def generate_trajectory_points(
     
     total_time = gap_distance_ft / vx
     
-    # Generate 50 points along the trajectory
     num_points = 50
     for i in range(num_points + 1):
         t = (i / num_points) * total_time
@@ -142,9 +177,7 @@ def calculate_jump_speed(
     gap_distance_ft: float,
     landing_height_diff_ft: float = 0
 ) -> dict:
-    """
-    Calculate the required speed to clear a gap using projectile motion physics.
-    """
+    """Calculate the required speed to clear a gap using projectile motion physics."""
     g = 32.174  # ft/s²
     theta = math.radians(ramp_angle_deg)
     x = gap_distance_ft
@@ -175,7 +208,6 @@ def calculate_jump_speed(
     landing_v_mph = landing_v_fps * 0.681818
     landing_v_kph = landing_v_fps * 1.09728
     
-    # Generate trajectory points
     trajectory = generate_trajectory_points(v_fps, theta, gap_distance_ft, landing_height_diff_ft)
     
     return {
@@ -196,7 +228,208 @@ def generate_share_code() -> str:
     return uuid.uuid4().hex[:8].upper()
 
 
-# API Routes
+# ==================== PAYMENT ENDPOINTS ====================
+
+@api_router.post("/payments/create-checkout", response_model=CheckoutResponse)
+async def create_checkout_session(request: CreateCheckoutRequest, http_request: Request):
+    """Create a Stripe checkout session for monthly subscription."""
+    try:
+        # Initialize Stripe
+        host_url = request.origin_url.rstrip('/')
+        webhook_url = f"{host_url}/api/webhook/stripe"
+        stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
+        
+        # Create success and cancel URLs
+        success_url = f"{host_url}/payment-success?session_id={{CHECKOUT_SESSION_ID}}"
+        cancel_url = f"{host_url}/payment-cancel"
+        
+        # Create checkout session with fixed $2.00 amount
+        checkout_request = CheckoutSessionRequest(
+            amount=SUBSCRIPTION_PRICE,
+            currency="usd",
+            success_url=success_url,
+            cancel_url=cancel_url,
+            metadata={
+                "device_id": request.device_id,
+                "subscription_type": "monthly",
+                "product": "dirt_bike_jump_calculator"
+            }
+        )
+        
+        session = await stripe_checkout.create_checkout_session(checkout_request)
+        
+        # Create payment transaction record
+        transaction = PaymentTransaction(
+            session_id=session.session_id,
+            device_id=request.device_id,
+            amount=SUBSCRIPTION_PRICE,
+            currency="usd",
+            status="pending",
+            payment_status="pending"
+        )
+        await db.payment_transactions.insert_one(transaction.dict())
+        
+        return CheckoutResponse(
+            checkout_url=session.url,
+            session_id=session.session_id
+        )
+    except Exception as e:
+        logging.error(f"Error creating checkout session: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create checkout: {str(e)}")
+
+
+@api_router.get("/payments/status/{session_id}")
+async def get_payment_status(session_id: str, http_request: Request):
+    """Check the status of a payment session."""
+    try:
+        # Get the origin from referer or use a default
+        origin = str(http_request.base_url).rstrip('/')
+        webhook_url = f"{origin}/api/webhook/stripe"
+        stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
+        
+        # Get status from Stripe
+        checkout_status = await stripe_checkout.get_checkout_status(session_id)
+        
+        # Get transaction from database
+        transaction = await db.payment_transactions.find_one({"session_id": session_id})
+        
+        if not transaction:
+            raise HTTPException(status_code=404, detail="Transaction not found")
+        
+        # Update transaction status if payment is completed
+        if checkout_status.payment_status == "paid" and transaction.get("status") != "completed":
+            # Calculate subscription expiry (30 days from now)
+            expires_at = datetime.utcnow() + timedelta(days=30)
+            
+            await db.payment_transactions.update_one(
+                {"session_id": session_id},
+                {
+                    "$set": {
+                        "status": "completed",
+                        "payment_status": "paid",
+                        "updated_at": datetime.utcnow(),
+                        "subscription_expires_at": expires_at
+                    }
+                }
+            )
+            
+            # Also update/create subscription record
+            await db.subscriptions.update_one(
+                {"device_id": transaction["device_id"]},
+                {
+                    "$set": {
+                        "is_active": True,
+                        "expires_at": expires_at,
+                        "updated_at": datetime.utcnow(),
+                        "last_payment_session": session_id
+                    }
+                },
+                upsert=True
+            )
+        elif checkout_status.status == "expired":
+            await db.payment_transactions.update_one(
+                {"session_id": session_id},
+                {
+                    "$set": {
+                        "status": "expired",
+                        "payment_status": "expired",
+                        "updated_at": datetime.utcnow()
+                    }
+                }
+            )
+        
+        return {
+            "status": checkout_status.status,
+            "payment_status": checkout_status.payment_status,
+            "amount": checkout_status.amount_total / 100,  # Convert cents to dollars
+            "currency": checkout_status.currency
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error checking payment status: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to check payment status: {str(e)}")
+
+
+@api_router.get("/subscription/status/{device_id}", response_model=SubscriptionStatus)
+async def get_subscription_status(device_id: str):
+    """Check if a device has an active subscription."""
+    subscription = await db.subscriptions.find_one({"device_id": device_id})
+    
+    if not subscription:
+        return SubscriptionStatus(
+            is_active=False,
+            device_id=device_id
+        )
+    
+    # Check if subscription is still valid
+    expires_at = subscription.get("expires_at")
+    is_active = expires_at and expires_at > datetime.utcnow() if expires_at else False
+    
+    return SubscriptionStatus(
+        is_active=is_active,
+        expires_at=expires_at,
+        device_id=device_id
+    )
+
+
+@api_router.post("/webhook/stripe")
+async def stripe_webhook(request: Request):
+    """Handle Stripe webhook events."""
+    try:
+        body = await request.body()
+        signature = request.headers.get("Stripe-Signature")
+        
+        # Initialize Stripe
+        host_url = str(request.base_url).rstrip('/')
+        webhook_url = f"{host_url}/api/webhook/stripe"
+        stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
+        
+        webhook_response = await stripe_checkout.handle_webhook(body, signature)
+        
+        if webhook_response.payment_status == "paid":
+            # Update transaction
+            session_id = webhook_response.session_id
+            transaction = await db.payment_transactions.find_one({"session_id": session_id})
+            
+            if transaction and transaction.get("status") != "completed":
+                expires_at = datetime.utcnow() + timedelta(days=30)
+                
+                await db.payment_transactions.update_one(
+                    {"session_id": session_id},
+                    {
+                        "$set": {
+                            "status": "completed",
+                            "payment_status": "paid",
+                            "updated_at": datetime.utcnow(),
+                            "subscription_expires_at": expires_at
+                        }
+                    }
+                )
+                
+                device_id = webhook_response.metadata.get("device_id")
+                if device_id:
+                    await db.subscriptions.update_one(
+                        {"device_id": device_id},
+                        {
+                            "$set": {
+                                "is_active": True,
+                                "expires_at": expires_at,
+                                "updated_at": datetime.utcnow(),
+                                "last_payment_session": session_id
+                            }
+                        },
+                        upsert=True
+                    )
+        
+        return {"status": "ok"}
+    except Exception as e:
+        logging.error(f"Webhook error: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+
+# ==================== CALCULATOR ENDPOINTS ====================
+
 @api_router.get("/")
 async def root():
     return {"message": "Dirt Bike Jump Calculator API"}
