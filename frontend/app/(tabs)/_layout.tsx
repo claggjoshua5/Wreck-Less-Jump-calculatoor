@@ -9,6 +9,10 @@ const CalculatorIcon = ({ color, size }: { color: string; size: number }) => (
   <Ionicons name="calculator" size={size} color={color} />
 );
 
+const MeasureIcon = ({ color, size }: { color: string; size: number }) => (
+  <Ionicons name="camera" size={size} color={color} />
+);
+
 const SavedIcon = ({ color, size }: { color: string; size: number }) => (
   <Ionicons name="bookmark" size={size} color={color} />
 );
@@ -70,6 +74,13 @@ export default function TabLayout() {
           options={{
             title: 'Calculator',
             tabBarIcon: CalculatorIcon,
+          }}
+        />
+        <Tabs.Screen
+          name="measure"
+          options={{
+            title: 'Measure',
+            tabBarIcon: MeasureIcon,
           }}
         />
         <Tabs.Screen

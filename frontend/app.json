@@ -11,7 +11,8 @@
     "ios": {
       "supportsTablet": true,
       "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "Tag your jump locations on the map"
+        "NSLocationWhenInUseUsageDescription": "Tag your jump locations on the map",
+        "NSCameraUsageDescription": "Take photos to measure ramp dimensions"
       }
     },
     "android": {
@@ -22,7 +23,8 @@
       "edgeToEdgeEnabled": true,
       "permissions": [
         "ACCESS_FINE_LOCATION",
-        "ACCESS_COARSE_LOCATION"
+        "ACCESS_COARSE_LOCATION",
+        "CAMERA"
       ]
     },
     "web": {
@@ -36,6 +38,18 @@
         "expo-location",
         {
           "locationAlwaysAndWhenInUsePermission": "Tag your jump locations on the map"
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Take photos to measure ramp dimensions"
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "cameraPermission": "Take photos to measure ramp dimensions"
         }
       ],
       [
