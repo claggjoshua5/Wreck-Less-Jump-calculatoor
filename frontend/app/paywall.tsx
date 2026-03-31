@@ -7,6 +7,7 @@ import {
   ActivityIndicator,
   Platform,
   ScrollView,
+  Image,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
@@ -121,11 +122,11 @@ export default function PaywallScreen() {
       <ScrollView contentContainerStyle={styles.scrollContent}>
         {/* Logo/Header */}
         <View style={styles.header}>
-          <View style={styles.logoContainer}>
-            <Ionicons name="speedometer" size={60} color="#FF6B35" />
-          </View>
-          <Text style={styles.title}>Dirt Bike Jump Calculator</Text>
-          <Text style={styles.subtitle}>Professional jump calculations at your fingertips</Text>
+          <Image
+            source={require('../assets/images/wreckless-logo.png')}
+            style={styles.logo}
+            resizeMode="contain"
+          />
         </View>
 
         {/* Features */}
@@ -244,26 +245,10 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 24,
   },
-  logoContainer: {
-    width: 100,
-    height: 100,
-    borderRadius: 50,
-    backgroundColor: 'rgba(255, 107, 53, 0.1)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: 16,
-  },
-  title: {
-    fontSize: 28,
-    fontWeight: 'bold',
-    color: '#fff',
-    textAlign: 'center',
+  logo: {
+    width: 280,
+    height: 200,
     marginBottom: 8,
-  },
-  subtitle: {
-    fontSize: 16,
-    color: '#888',
-    textAlign: 'center',
   },
   featuresContainer: {
     backgroundColor: '#1E1E1E',

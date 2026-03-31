@@ -13,6 +13,7 @@ import {
   Dimensions,
   Modal,
   Share,
+  Image,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
@@ -480,9 +481,11 @@ export default function Index() {
         >
           {/* Header */}
           <View style={styles.header}>
-            <Ionicons name="speedometer" size={40} color="#FF6B35" />
-            <Text style={styles.title}>Dirt Bike Jump Calculator</Text>
-            <Text style={styles.subtitle}>Calculate the speed needed to clear your gap</Text>
+            <Image
+              source={require('../../assets/images/wreckless-logo.png')}
+              style={styles.headerLogo}
+              resizeMode="contain"
+            />
           </View>
 
           {/* Unit Toggle */}
@@ -825,7 +828,11 @@ const styles = StyleSheet.create({
   },
   header: {
     alignItems: 'center',
-    marginBottom: 24,
+    marginBottom: 16,
+  },
+  headerLogo: {
+    width: 250,
+    height: 140,
   },
   title: {
     fontSize: 26,

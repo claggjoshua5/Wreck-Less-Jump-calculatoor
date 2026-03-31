@@ -1,11 +1,11 @@
 {
   "expo": {
-    "name": "Dirt Bike Jump Calculator",
-    "slug": "dirt-bike-jump-calculator",
+    "name": "Wreck-Less Jump Calculator",
+    "slug": "wreck-less-jump-calculator",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/images/icon.png",
-    "scheme": "jumpcalc",
+    "icon": "./assets/images/wreckless-logo.png",
+    "scheme": "wreckless",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
@@ -16,7 +16,7 @@
     },
     "android": {
       "adaptiveIcon": {
-        "foregroundImage": "./assets/images/adaptive-icon.png",
+        "foregroundImage": "./assets/images/wreckless-logo.png",
         "backgroundColor": "#000"
       },
       "edgeToEdgeEnabled": true,
