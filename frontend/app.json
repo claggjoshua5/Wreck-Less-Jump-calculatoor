@@ -4,21 +4,23 @@
     "slug": "wreck-less-jump-calculator",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/images/wreckless-logo.png",
+    "icon": "./assets/images/icon-1024.png",
     "scheme": "wreckless",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
+      "bundleIdentifier": "com.joshandheather.wrecklessjumpcalculator",
       "infoPlist": {
         "NSLocationWhenInUseUsageDescription": "Tag your jump locations on the map",
         "NSCameraUsageDescription": "Take photos to measure ramp dimensions"
       }
     },
     "android": {
+      "package": "com.joshandheather.wrecklessjumpcalculator",
       "adaptiveIcon": {
-        "foregroundImage": "./assets/images/wreckless-logo.png",
-        "backgroundColor": "#000"
+        "foregroundImage": "./assets/images/adaptive-icon.png",
+        "backgroundColor": "#000000"
       },
       "edgeToEdgeEnabled": true,
       "permissions": [

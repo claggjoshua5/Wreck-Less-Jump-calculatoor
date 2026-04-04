@@ -1,4 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -540,7 +541,108 @@ async def stripe_webhook(request: Request):
 
 @api_router.get("/")
 async def root():
-    return {"message": "Dirt Bike Jump Calculator API"}
+    return {"message": "Wreck-Less Jump Calculator API"}
+
+
+@api_router.get("/privacy-policy", response_class=HTMLResponse)
+async def privacy_policy():
+    """Return the privacy policy page."""
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Privacy Policy - Wreck-Less Jump Calculator</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: #121212;
+                color: #fff;
+                line-height: 1.6;
+                padding: 20px;
+                max-width: 800px;
+                margin: 0 auto;
+            }
+            h1 { color: #FF6B35; margin-bottom: 10px; font-size: 28px; }
+            h2 { color: #FF6B35; margin: 30px 0 15px; font-size: 20px; }
+            p { margin-bottom: 15px; color: #ccc; }
+            ul { margin: 15px 0 15px 20px; color: #ccc; }
+            li { margin-bottom: 8px; }
+            .logo { text-align: center; margin-bottom: 30px; }
+            .logo span { font-size: 24px; font-weight: bold; color: #FF6B35; }
+            .date { color: #888; font-size: 14px; margin-bottom: 30px; }
+            .contact { background: #1E1E1E; padding: 20px; border-radius: 12px; margin-top: 30px; }
+            .contact h3 { color: #FF6B35; margin-bottom: 10px; }
+            .footer { text-align: center; margin-top: 40px; color: #666; font-size: 12px; }
+        </style>
+    </head>
+    <body>
+        <div class="logo">
+            <span>WRECK-LESS JUMP CALCULATOR</span>
+        </div>
+        
+        <h1>Privacy Policy</h1>
+        <p class="date">Last Updated: April 2026</p>
+        
+        <p>Josh & Heather Productions ("we", "our", or "us") operates the Wreck-Less Jump Calculator mobile application (the "App"). This Privacy Policy explains how we collect, use, and protect your information.</p>
+        
+        <h2>Information We Collect</h2>
+        <p>We collect the following types of information:</p>
+        <ul>
+            <li><strong>Device Information:</strong> A unique device identifier to manage your subscription and saved calculations.</li>
+            <li><strong>Location Data:</strong> If you choose to save a calculation with location, we store the GPS coordinates. This is optional and only collected with your permission.</li>
+            <li><strong>Calculation Data:</strong> Jump calculations you choose to save, including ramp measurements and results.</li>
+            <li><strong>Payment Information:</strong> Processed securely through Stripe. We do not store your credit card details.</li>
+            <li><strong>Camera Data:</strong> Photos taken for measurement are processed locally on your device and are not uploaded to our servers.</li>
+        </ul>
+        
+        <h2>How We Use Your Information</h2>
+        <ul>
+            <li>To provide and maintain the App's functionality</li>
+            <li>To manage your subscription and free trial</li>
+            <li>To save and sync your jump calculations</li>
+            <li>To display jump locations on the map (if you choose to share)</li>
+            <li>To improve our services</li>
+        </ul>
+        
+        <h2>Data Sharing</h2>
+        <p>We do not sell your personal information. We may share data with:</p>
+        <ul>
+            <li><strong>Stripe:</strong> For payment processing</li>
+            <li><strong>Other Users:</strong> Only if you choose to share a calculation using a share code</li>
+        </ul>
+        
+        <h2>Data Security</h2>
+        <p>We implement appropriate security measures to protect your information. Payment data is encrypted and processed by Stripe, a PCI-compliant payment processor.</p>
+        
+        <h2>Your Rights</h2>
+        <p>You have the right to:</p>
+        <ul>
+            <li>Access your saved calculations</li>
+            <li>Delete your saved calculations</li>
+            <li>Disable location sharing at any time</li>
+            <li>Cancel your subscription</li>
+        </ul>
+        
+        <h2>Children's Privacy</h2>
+        <p>The App is not intended for children under 13. We do not knowingly collect information from children under 13.</p>
+        
+        <h2>Changes to This Policy</h2>
+        <p>We may update this Privacy Policy from time to time. We will notify you of any changes by posting the new policy on this page.</p>
+        
+        <div class="contact">
+            <h3>Contact Us</h3>
+            <p>If you have questions about this Privacy Policy, please contact us at:</p>
+            <p><strong>Josh & Heather Productions</strong></p>
+        </div>
+        
+        <p class="footer">&copy; 2026 Josh & Heather Productions. All rights reserved.</p>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
 
 
 @api_router.post("/calculate-jump", response_model=JumpCalculationResult)
