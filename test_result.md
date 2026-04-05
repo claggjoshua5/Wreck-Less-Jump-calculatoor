@@ -190,6 +190,18 @@ frontend:
         agent: "main"
         comment: "Map tab with SVG-based map visualization showing saved/shared locations with zoom controls, legend, and location details."
 
+  - task: "AR Measurement Mode"
+    implemented: true
+    working: "NA"
+    file: "/app/frontend/app/(tabs)/measure.tsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "AR mode added with mode selector (AR/Sensor/Photo). Web shows polished fallback UI with AR mockup and feature descriptions. Native ViroReact AR implementation with full hit-testing, marker placement, distance/angle calculation, and save functionality. Cannot test AR on web - requires physical iOS/Android device."
+
   - task: "Tab Navigation"
     implemented: true
     working: true

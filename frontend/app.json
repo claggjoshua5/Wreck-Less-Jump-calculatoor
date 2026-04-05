@@ -63,7 +63,8 @@
           "backgroundColor": "#000"
         }
       ],
-      "expo-web-browser"
+      "expo-web-browser",
+      "@reactvision/react-viro"
     ],
     "experiments": {
       "typedRoutes": true

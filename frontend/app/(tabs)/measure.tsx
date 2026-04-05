@@ -17,6 +17,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { Accelerometer } from 'expo-sensors';
 import * as ImagePicker from 'expo-image-picker';
 import Svg, { Circle, Line, Rect } from 'react-native-svg';
+import ARMeasureView from '../../components/ARMeasureView';
 
 const { width } = Dimensions.get('window');
 
@@ -36,7 +37,12 @@ interface Measurements {
   landingHeight: number | null;
 }
 
+type MeasureMode = 'ar' | 'sensor' | 'photo';
+
 export default function MeasureScreen() {
+  // Mode state
+  const [mode, setMode] = useState<MeasureMode>('ar');
+
   // Angle measurement states
   const [isCalibrating, setIsCalibrating] = useState(false);
   const [currentAngle, setCurrentAngle] = useState<number | null>(null);
@@ -236,6 +242,17 @@ export default function MeasureScreen() {
     setMeasurementMode(null);
   };
 
+  // AR measurement callback
+  const handleARMeasurement = (type: 'rampAngle' | 'rampHeight' | 'gapDistance', value: number) => {
+    if (type === 'rampAngle') {
+      setMeasurements(prev => ({ ...prev, rampAngle: value }));
+    } else if (type === 'rampHeight') {
+      setMeasurements(prev => ({ ...prev, rampHeight: value }));
+    } else if (type === 'gapDistance') {
+      setMeasurements(prev => ({ ...prev, gapDistance: value }));
+    }
+  };
+
   const getModeInstructions = () => {
     switch (measurementMode) {
       case 'card':
@@ -314,12 +331,48 @@ export default function MeasureScreen() {
       <ScrollView style={styles.scrollView} contentContainerStyle={styles.scrollContent}>
         {/* Header */}
         <View style={styles.header}>
-          <Ionicons name="camera" size={32} color="#FF6B35" />
+          <Ionicons name="construct" size={32} color="#FF6B35" />
           <Text style={styles.title}>Measure Tool</Text>
           <Text style={styles.subtitle}>Use your phone to measure ramp dimensions</Text>
         </View>
 
-        {/* Angle Measurement Section */}
+        {/* Mode Selector */}
+        <View style={styles.modeSelector}>
+          <TouchableOpacity
+            style={[styles.modeTab, mode === 'ar' && styles.modeTabActive]}
+            onPress={() => setMode('ar')}
+          >
+            <Ionicons name="scan" size={18} color={mode === 'ar' ? '#fff' : '#888'} />
+            <Text style={[styles.modeTabText, mode === 'ar' && styles.modeTabTextActive]}>AR</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.modeTab, mode === 'sensor' && styles.modeTabActive]}
+            onPress={() => setMode('sensor')}
+          >
+            <Ionicons name="phone-portrait" size={18} color={mode === 'sensor' ? '#fff' : '#888'} />
+            <Text style={[styles.modeTabText, mode === 'sensor' && styles.modeTabTextActive]}>Sensor</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.modeTab, mode === 'photo' && styles.modeTabActive]}
+            onPress={() => setMode('photo')}
+          >
+            <Ionicons name="camera" size={18} color={mode === 'photo' ? '#fff' : '#888'} />
+            <Text style={[styles.modeTabText, mode === 'photo' && styles.modeTabTextActive]}>Photo</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* AR Mode */}
+        {mode === 'ar' && (
+          <View style={styles.section}>
+            <ARMeasureView
+              onMeasurement={handleARMeasurement}
+              onClose={() => setMode('sensor')}
+            />
+          </View>
+        )}
+
+        {/* Sensor Mode - Angle Measurement */}
+        {mode === 'sensor' && (
         <View style={styles.section}>
           <View style={styles.sectionHeader}>
             <Ionicons name="analytics" size={20} color="#FF6B35" />
@@ -371,8 +424,10 @@ export default function MeasureScreen() {
             </View>
           )}
         </View>
+        )}
 
-        {/* Photo Measurement Section */}
+        {/* Photo Mode - Distance Measurement */}
+        {mode === 'photo' && (
         <View style={styles.section}>
           <View style={styles.sectionHeader}>
             <Ionicons name="image" size={20} color="#FF6B35" />
@@ -484,6 +539,7 @@ export default function MeasureScreen() {
             </View>
           )}
         </View>
+        )}
 
         {/* Summary Section */}
         {(measurements.rampAngle !== null || measurements.rampHeight !== null || 
@@ -556,7 +612,7 @@ const styles = StyleSheet.create({
   },
   header: {
     alignItems: 'center',
-    marginBottom: 24,
+    marginBottom: 16,
   },
   title: {
     fontSize: 24,
@@ -568,6 +624,34 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#888',
     marginTop: 4,
+  },
+  modeSelector: {
+    flexDirection: 'row',
+    backgroundColor: '#1E1E1E',
+    borderRadius: 14,
+    padding: 4,
+    marginBottom: 20,
+    gap: 4,
+  },
+  modeTab: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 12,
+    borderRadius: 11,
+    gap: 6,
+  },
+  modeTabActive: {
+    backgroundColor: '#FF6B35',
+  },
+  modeTabText: {
+    color: '#888',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  modeTabTextActive: {
+    color: '#fff',
   },
   section: {
     backgroundColor: '#1E1E1E',
