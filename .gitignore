@@ -81,5 +81,4 @@ memory/test_credentials.md
 # Mobile development
 android-sdk/-e 
 # Environment files
-*.env
-*.env.*
+# Note: .env files are NOT ignored for Emergent deployments

@@ -68,9 +68,7 @@ export default function PaywallScreen() {
     setError('');
 
     try {
-      const originUrl = Platform.OS === 'web' 
-        ? window.location.origin 
-        : EXPO_PUBLIC_BACKEND_URL;
+      const originUrl = window.location.origin;
 
       const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/payments/create-checkout`, {
         method: 'POST',
