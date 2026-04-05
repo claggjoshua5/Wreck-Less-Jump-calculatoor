@@ -13,12 +13,14 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
 import * as WebBrowser from 'expo-web-browser';
+import { useRouter } from 'expo-router';
 import { useSubscription } from './_layout';
 
 const EXPO_PUBLIC_BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL;
 
 export default function PaywallScreen() {
   const { deviceId, checkSubscription, trialInfo } = useSubscription();
+  const router = useRouter();
   const [isLoading, setIsLoading] = useState(false);
   const [isTrialLoading, setIsTrialLoading] = useState(false);
   const [error, setError] = useState('');
@@ -28,37 +30,32 @@ export default function PaywallScreen() {
     setError('');
 
     try {
-      const originUrl = Platform.OS === 'web' 
-        ? window.location.origin 
-        : EXPO_PUBLIC_BACKEND_URL;
-
-      // Call the trial endpoint (requires credit card)
+      // Start free trial — no credit card or Stripe checkout needed
       const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/payments/start-trial`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          origin_url: originUrl,
           device_id: deviceId,
         }),
       });
 
       if (!response.ok) {
-        throw new Error('Failed to create trial checkout session');
+        throw new Error('Failed to start free trial');
       }
 
       const data = await response.json();
 
-      // Open Stripe Checkout for trial (card required but not charged)
-      if (Platform.OS === 'web') {
-        window.location.href = data.checkout_url;
-      } else {
-        const result = await WebBrowser.openBrowserAsync(data.checkout_url);
-        if (result.type === 'cancel' || result.type === 'dismiss') {
-          await checkSubscription();
-        }
+      if (!data.success) {
+        setError(data.message || 'Could not start trial. Please try subscribing instead.');
+        return;
       }
+
+      // Trial started! Refresh subscription state to pass the paywall
+      await checkSubscription();
+      // Navigate to main app
+      router.replace('/(tabs)');
     } catch (err: any) {
       setError(err.message || 'Something went wrong. Please try again.');
     } finally {
@@ -155,18 +152,18 @@ export default function PaywallScreen() {
             <Text style={styles.trialDaysLabel}>Day Free Trial</Text>
           </View>
           <View style={styles.trialInfo}>
-            <Ionicons name="card" size={16} color="#888" />
-            <Text style={styles.trialInfoText}>Credit card required</Text>
+            <Ionicons name="checkmark-circle" size={16} color="#4CAF50" />
+            <Text style={styles.trialInfoText}>No credit card needed</Text>
           </View>
-          <Text style={styles.trialNote}>You won't be charged until trial ends</Text>
+          <Text style={styles.trialNote}>Try everything free for 3 days</Text>
         </View>
 
         {/* Pricing Card */}
         <View style={styles.pricingCard}>
           <View style={styles.pricingHeader}>
-            <Text style={styles.pricingLabel}>THEN $2/MONTH</Text>
+            <Text style={styles.pricingLabel}>THEN $2.99/MONTH</Text>
           </View>
-          <Text style={styles.pricingNote}>Cancel anytime before trial ends</Text>
+          <Text style={styles.pricingNote}>Subscribe when your trial ends</Text>
         </View>
 
         {/* Error Message */}
@@ -211,7 +208,7 @@ export default function PaywallScreen() {
           ) : (
             <>
               <Ionicons name="card" size={24} color="#FF6B35" />
-              <Text style={styles.subscribeButtonText}>Subscribe Now - $2/month</Text>
+              <Text style={styles.subscribeButtonText}>Subscribe Now - $2.99/month</Text>
             </>
           )}
         </TouchableOpacity>
@@ -219,7 +216,7 @@ export default function PaywallScreen() {
         {/* Terms */}
         <Text style={styles.terms}>
           By starting a trial, you agree to our Terms of Service and Privacy Policy. 
-          After the 3-day trial, your subscription will automatically renew at $2/month until cancelled.
+          After the 3-day free trial, you can subscribe for $2.99/month to keep using the app.
         </Text>
 
         {/* Secure Payment Badge */}

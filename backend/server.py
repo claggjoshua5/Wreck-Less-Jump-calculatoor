@@ -26,7 +26,7 @@ db = client[os.environ['DB_NAME']]
 
 # Stripe configuration
 STRIPE_API_KEY = os.environ.get('STRIPE_API_KEY')
-SUBSCRIPTION_PRICE = 2.00  # $2.00 monthly subscription
+SUBSCRIPTION_PRICE = 2.99  # $2.99 monthly subscription
 
 # Create the main app without a prefix
 app = FastAPI()
@@ -58,9 +58,19 @@ class CreateCheckoutRequest(BaseModel):
     device_id: str
 
 
+class StartTrialRequest(BaseModel):
+    device_id: str
+
+
 class CheckoutResponse(BaseModel):
     checkout_url: str
     session_id: str
+
+
+class StartTrialResponse(BaseModel):
+    success: bool
+    message: str
+    trial_expires_at: Optional[datetime] = None
 
 
 class TrialStatus(BaseModel):
@@ -288,51 +298,57 @@ async def create_checkout_session(request: CreateCheckoutRequest, http_request: 
         raise HTTPException(status_code=500, detail=f"Failed to create checkout: {str(e)}")
 
 
-@api_router.post("/payments/start-trial", response_model=CheckoutResponse)
-async def create_trial_checkout_session(request: CreateCheckoutRequest, http_request: Request):
-    """Create a Stripe checkout session with 3-day free trial."""
+@api_router.post("/payments/start-trial", response_model=StartTrialResponse)
+async def start_free_trial(request: StartTrialRequest):
+    """Start a 3-day free trial — no credit card required."""
     try:
-        host_url = request.origin_url.rstrip('/')
-        webhook_url = f"{host_url}/api/webhook/stripe"
-        stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
-        
-        success_url = f"{host_url}/payment-success?session_id={{CHECKOUT_SESSION_ID}}&trial=true"
-        cancel_url = f"{host_url}/payment-cancel"
-        
-        # Create checkout with trial - user enters card but isn't charged for 3 days
-        checkout_request = CheckoutSessionRequest(
-            amount=SUBSCRIPTION_PRICE,
-            currency="usd",
-            success_url=success_url,
-            cancel_url=cancel_url,
-            metadata={
-                "device_id": request.device_id,
-                "subscription_type": "monthly_with_trial",
-                "product": "dirt_bike_jump_calculator",
-                "has_trial": "true",
-                "trial_days": "3"
-            }
+        # Check if device already has an active subscription or used a trial
+        existing = await db.subscriptions.find_one({"device_id": request.device_id})
+
+        if existing:
+            # If already active, don't create a new trial
+            expires_at = existing.get("expires_at")
+            if expires_at and expires_at > datetime.utcnow():
+                return StartTrialResponse(
+                    success=True,
+                    message="You already have an active subscription or trial.",
+                    trial_expires_at=expires_at
+                )
+            # If they had a trial before that expired, they can't start another
+            if existing.get("trial_used", False):
+                return StartTrialResponse(
+                    success=False,
+                    message="Free trial already used. Please subscribe to continue."
+                )
+
+        now = datetime.utcnow()
+        trial_ends_at = now + timedelta(days=3)
+
+        subscription_data = {
+            "device_id": request.device_id,
+            "is_active": True,
+            "is_trial": True,
+            "trial_used": True,
+            "expires_at": trial_ends_at,
+            "trial_started_at": now,
+            "trial_ends_at": trial_ends_at,
+            "updated_at": now,
+        }
+
+        await db.subscriptions.update_one(
+            {"device_id": request.device_id},
+            {"$set": subscription_data},
+            upsert=True
         )
-        
-        session = await stripe_checkout.create_checkout_session(checkout_request)
-        
-        transaction = PaymentTransaction(
-            session_id=session.session_id,
-            device_id=request.device_id,
-            amount=0,  # Trial starts at $0
-            currency="usd",
-            status="pending",
-            payment_status="pending"
-        )
-        await db.payment_transactions.insert_one(transaction.dict())
-        
-        return CheckoutResponse(
-            checkout_url=session.url,
-            session_id=session.session_id
+
+        return StartTrialResponse(
+            success=True,
+            message="Your 3-day free trial has started!",
+            trial_expires_at=trial_ends_at
         )
     except Exception as e:
-        logging.error(f"Error creating trial checkout session: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to create trial checkout: {str(e)}")
+        logging.error(f"Error starting free trial: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to start trial: {str(e)}")
 
 
 @api_router.get("/payments/status/{session_id}")
