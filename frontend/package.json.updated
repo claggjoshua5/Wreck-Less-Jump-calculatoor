@@ -1,0 +1,12 @@
+SCRIPTS UPDATE: Add these to the "scripts" section of frontend/package.json:
+
+"test": "jest",
+"test:watch": "jest --watch",
+"test:coverage": "jest --coverage",
+"lint": "eslint app --ext .ts,.tsx",
+"lint:fix": "eslint app --ext .ts,.tsx --fix && prettier --write app",
+"type-check": "tsc --noEmit",
+"format": "prettier --write 'app/**/*.{ts,tsx,json}'"
+
+AND install these dev dependencies:
+npm install --save-dev jest jest-expo ts-jest @testing-library/react-native @testing-library/jest-native eslint-plugin-react-hooks @typescript-eslint/eslint-plugin @typescript-eslint/parser prettier
