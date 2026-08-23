@@ -24,12 +24,28 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-          cache: gradle
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: |
+          corepack enable
+          yarn install --non-interactive
+
+      - name: Generate Android project
+        working-directory: frontend
+        run: CI=1 npx expo prebuild --platform android
 
       - name: Ensure gradlew is executable
+        working-directory: frontend/android
         run: chmod +x ./gradlew
 
       - name: Build debug APK
+        working-directory: frontend/android
         run: ./gradlew assembleDebug --stacktrace
 
       - name: Upload APK artifact(s)
@@ -37,5 +53,5 @@ jobs:
         with:
           name: debug-apk
           path: |
-            **/build/outputs/apk/debug/*.apk
+            frontend/android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
