@@ -18,6 +18,7 @@
     },
     "android": {
       "package": "com.joshandheather.wrecklessjumpcalculator",
+      "versionCode": 1,
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/adaptive-icon.png",
         "backgroundColor": "#000000"
