@@ -23,10 +23,12 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: 'yarn'
+          cache-dependency-path: 'frontend/yarn.lock'
 
       - name: Install dependencies
         working-directory: frontend
-        run: yarn install
+        run: yarn install --frozen-lockfile
 
       - name: Prebuild Android
         working-directory: frontend
@@ -45,7 +47,7 @@ jobs:
 
       - name: Build debug APK
         working-directory: frontend/android
-        run: ./gradlew assembleDebug --stacktrace
+        run: ./gradlew assembleDebug --stacktrace --build-cache -x test -Dorg.gradle.parallel=true -Dorg.gradle.workers.max=4
 
       - name: Debug - List all APK files
         if: always()
