@@ -19,10 +19,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Free runner disk space
+        run: |
+          echo "Disk usage before cleanup:"
+          df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/.ghcup
+          sudo docker image prune --all --force || true
+          echo "Disk usage after cleanup:"
+          df -h /
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: 'npm'
           cache-dependency-path: 'frontend/package-lock.json'
 
@@ -47,7 +58,7 @@ jobs:
 
       - name: Build debug APK
         working-directory: frontend/android
-        run: ./gradlew assembleDebug --stacktrace --build-cache -x test -Dorg.gradle.parallel=true -Dorg.gradle.workers.max=4
+        run: ./gradlew assembleDebug --stacktrace --no-build-cache --no-daemon -x test --max-workers=2
 
       - name: Debug - List all APK files
         if: always()
