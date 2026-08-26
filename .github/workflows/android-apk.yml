@@ -43,7 +43,7 @@ jobs:
 
       - name: Prebuild Android
         working-directory: frontend
-        run: npx expo prebuild --platform android
+        run: npx expo prebuild --platform android --no-install --non-interactive
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
