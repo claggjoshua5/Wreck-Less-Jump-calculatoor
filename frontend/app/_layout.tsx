@@ -1,6 +1,12 @@
 import React, { useState, useEffect, createContext, useContext } from 'react';
 import { Stack } from 'expo-router';
 import { Platform } from 'react-native';
+import * as SplashScreen from 'expo-splash-screen';
+
+// Keep the splash screen visible until we finish initialization
+SplashScreen.preventAutoHideAsync().catch(() => {
+  // If preventAutoHideAsync fails (e.g., already hidden), ignore it
+});
 
 const EXPO_PUBLIC_BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL;
 
@@ -102,11 +108,22 @@ export default function RootLayout() {
       setIsSubscribed(true);
     } finally {
       setIsLoading(false);
+      SplashScreen.hideAsync().catch(() => {
+        // Ignore errors if splash screen is already hidden
+      });
     }
   };
 
   useEffect(() => {
     checkSubscription();
+
+    // Safety timeout: hide splash after 5 s regardless of initialization state
+    const timer = setTimeout(() => {
+      SplashScreen.hideAsync().catch(() => {});
+      setIsLoading(false);
+    }, 5000);
+
+    return () => clearTimeout(timer);
   }, []);
 
   const setSubscribed = (value: boolean) => {

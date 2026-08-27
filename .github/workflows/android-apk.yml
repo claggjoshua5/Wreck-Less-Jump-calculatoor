@@ -74,12 +74,12 @@ jobs:
         timeout-minutes: 45
         working-directory: frontend/android
         env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
           GRADLE_OPTS: '-Dorg.gradle.jvmargs="-Xmx2048m -XX:MaxMetaspaceSize=512m" -Dorg.gradle.daemon=false'
         run: |
           ./gradlew assembleDebug \
             --stacktrace \
             --build-cache \
-            --configuration-cache \
             -x test \
             -x lint \
             --no-watch-fs \
