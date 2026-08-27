@@ -204,15 +204,18 @@ frontend:
 
   - task: "Tab Navigation"
     implemented: true
-    working: true
+    working: false
     file: "/app/frontend/app/_layout.tsx"
-    stuck_count: 0
+    stuck_count: 1
     priority: "medium"
-    needs_retesting: false
+    needs_retesting: true
     status_history:
       - working: true
         agent: "main"
         comment: "Bottom tab navigation with Calculator, Saved, and Map tabs. Icons and styling working correctly."
+      - working: false
+        agent: "user"
+        comment: "User reported the Android app is stuck on the first screen after opening the downloaded app."
 
 metadata:
   created_by: "main_agent"

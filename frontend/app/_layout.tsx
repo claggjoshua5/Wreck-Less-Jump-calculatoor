@@ -2,20 +2,16 @@ import React, { useState, useEffect, createContext, useContext } from 'react';
 import { Stack } from 'expo-router';
 import { Platform } from 'react-native';
 import * as SplashScreen from 'expo-splash-screen';
+import {
+  fetchJsonWithBackend,
+  isBackendConfigured,
+  TrialInfo,
+} from '@/lib/appSupport';
 
 // Keep the splash screen visible until we finish initialization
 SplashScreen.preventAutoHideAsync().catch(() => {
   // If preventAutoHideAsync fails (e.g., already hidden), ignore it
 });
-
-const EXPO_PUBLIC_BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL;
-
-interface TrialInfo {
-  is_trial_active: boolean;
-  trial_started_at?: string;
-  trial_expires_at?: string;
-  trial_days_remaining?: number;
-}
 
 interface SubscriptionContextType {
   isSubscribed: boolean;
@@ -94,18 +90,30 @@ export default function RootLayout() {
       const id = await getDeviceId();
       setDeviceId(id);
       
-      const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/subscription/status/${id}`);
-      if (response.ok) {
-        const data = await response.json();
-        setIsSubscribed(data.is_active);
-        setIsTrial(data.is_trial || false);
-        setTrialInfo(data.trial_info || null);
-        setStatusMessage(data.status_message || '');
+      if (!isBackendConfigured) {
+        setIsSubscribed(true);
+        setIsTrial(false);
+        setTrialInfo(null);
+        setStatusMessage('Offline mode enabled');
+        return;
       }
+
+      const data = await fetchJsonWithBackend<{
+        is_active: boolean;
+        is_trial?: boolean;
+        trial_info?: TrialInfo | null;
+        status_message?: string;
+      }>(`/api/subscription/status/${id}`);
+      setIsSubscribed(Boolean(data.is_active));
+      setIsTrial(Boolean(data.is_trial));
+      setTrialInfo(data.trial_info ?? null);
+      setStatusMessage(data.status_message ?? '');
     } catch (error) {
       console.error('Error checking subscription:', error);
-      // On error, allow access (graceful degradation)
       setIsSubscribed(true);
+      setIsTrial(false);
+      setTrialInfo(null);
+      setStatusMessage('Offline mode enabled');
     } finally {
       setIsLoading(false);
       SplashScreen.hideAsync().catch(() => {
