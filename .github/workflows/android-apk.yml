@@ -71,7 +71,7 @@ jobs:
         run: chmod +x ./gradlew
 
       - name: Build debug APK
-        timeout-minutes: 20
+        timeout-minutes: 45
         working-directory: frontend/android
         env:
           GRADLE_OPTS: '-Dorg.gradle.jvmargs="-Xmx2048m -XX:MaxMetaspaceSize=512m" -Dorg.gradle.daemon=false'
