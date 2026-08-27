@@ -106,7 +106,7 @@ export default function Index() {
       
       requestAnimationFrame(animate);
     }
-  }, [isAnimating]);
+  }, [isAnimating, result]);
 
   const validateInputs = (): boolean => {
     if (!rampAngle || !gapDistance || !bikeWeight || !riderWeight) {
@@ -236,12 +236,14 @@ export default function Index() {
       setSaveName('');
       setSaveDescription('');
       
-      if (shareCalculation && savedData.share_code) {
+      const shareCode = savedData.share_code;
+
+      if (shareCalculation && shareCode) {
         Alert.alert(
           'Saved & Shared!',
-          `Your calculation has been saved.\n\nShare Code: ${savedData.share_code}`,
+          `Your calculation has been saved.\n\nShare Code: ${shareCode}`,
           [
-            { text: 'Copy Code', onPress: () => handleShareCode(savedData.share_code) },
+            { text: 'Copy Code', onPress: () => handleShareCode(shareCode) },
             { text: 'OK' },
           ]
         );

@@ -145,7 +145,7 @@ export default function MeasureScreen() {
     }
 
     const result = await ImagePicker.launchCameraAsync({
-      mediaTypes: ImagePicker.MediaType.images,
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
       quality: 0.8,
       allowsEditing: false,
     });
@@ -481,7 +481,7 @@ export default function MeasureScreen() {
                 />
                 <Text style={[
                   styles.calibrationText,
-                  pixelsPerInch && styles.calibrationTextActive
+                  pixelsPerInch ? styles.calibrationTextActive : null
                 ]}>
                   {pixelsPerInch ? 'Credit card calibrated' : 'Mark credit card edges'}
                 </Text>
@@ -511,7 +511,7 @@ export default function MeasureScreen() {
                   ]}
                   onPress={() => startMeasurement('gap')}
                 >
-                  <Ionicons name="resize-horizontal" size={18} color="#fff" />
+                  <Ionicons name="resize" size={18} color="#fff" />
                   <Text style={styles.measureButtonText}>
                     {measurements.gapDistance !== null ? `${measurements.gapDistance} ft` : 'Gap Distance'}
                   </Text>

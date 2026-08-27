@@ -14,7 +14,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
 import * as Location from 'expo-location';
-import Svg, { Circle, Path, G, Text as SvgText, Rect, Line } from 'react-native-svg';
+import Svg, { Circle, G, Text as SvgText, Rect, Line } from 'react-native-svg';
 import {
   fetchJsonWithBackend,
   isBackendConfigured,
@@ -22,7 +22,7 @@ import {
   MapLocation,
 } from '@/lib/appSupport';
 
-const { width, height } = Dimensions.get('window');
+const { width } = Dimensions.get('window');
 
 export default function MapScreen() {
   const [locations, setLocations] = useState<MapLocation[]>([]);

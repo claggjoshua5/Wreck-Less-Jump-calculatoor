@@ -216,6 +216,9 @@ frontend:
       - working: false
         agent: "user"
         comment: "User reported the Android app is stuck on the first screen after opening the downloaded app."
+      - working: false
+        agent: "main"
+        comment: "Reworked startup to bypass missing/unreachable backend checks, moved calculator/save/map flows to offline-safe fallbacks, and delayed the first location permission request until save time. Local validation passed with `npm run lint`, `npx tsc --noEmit`, and `npx expo export --platform android`; native Gradle APK build was blocked by sandbox DNS access to dl.google.com."
 
 metadata:
   created_by: "main_agent"

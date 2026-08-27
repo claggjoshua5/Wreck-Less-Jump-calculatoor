@@ -92,7 +92,7 @@ export default function SavedScreen() {
                 await deleteCalculationLocally(id);
               }
               setCalculations(calculations.filter(c => c.id !== id));
-            } catch (error) {
+            } catch {
               Alert.alert('Error', 'Failed to delete calculation');
             }
           },
@@ -132,7 +132,7 @@ export default function SavedScreen() {
         calc.is_shared = true;
         setCalculations([...calculations]);
         await shareCode(calc);
-      } catch (error) {
+      } catch {
         Alert.alert('Error', 'Failed to generate share code');
       }
     }
@@ -178,7 +178,7 @@ export default function SavedScreen() {
       setSelectedCalc(data);
       setShowLookupModal(false);
       setLookupCode('');
-    } catch (error) {
+    } catch {
       Alert.alert('Not Found', 'No calculation found with that share code.');
     } finally {
       setIsLookingUp(false);

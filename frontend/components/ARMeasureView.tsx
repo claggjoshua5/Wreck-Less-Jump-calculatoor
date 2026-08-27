@@ -350,7 +350,7 @@ export default function ARMeasureView({ onMeasurement, onClose }: Props) {
     <Modal visible={arActive} animationType="slide" statusBarTranslucent>
       <View style={styles.arContainer}>
         <ViroARSceneNavigator
-          initialScene={{ scene: ARMeasureScene }}
+          initialScene={{ scene: ARMeasureScene as unknown as () => React.ReactElement }}
           viroAppProps={{
             markers,
             onHitTestUpdate: (pos: Viro3DPoint) => {

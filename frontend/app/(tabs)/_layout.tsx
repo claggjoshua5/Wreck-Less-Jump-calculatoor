@@ -22,7 +22,7 @@ const MapIcon = ({ color, size }: { color: string; size: number }) => (
 );
 
 export default function TabLayout() {
-  const { isSubscribed, isLoading, isTrial, trialInfo, statusMessage } = useSubscription();
+  const { isSubscribed, isLoading, isTrial, trialInfo } = useSubscription();
 
   // Show loading while checking subscription
   if (isLoading) {
