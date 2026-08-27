@@ -71,6 +71,7 @@ jobs:
         run: chmod +x ./gradlew
 
       - name: Build debug APK
+        timeout-minutes: 45
         working-directory: frontend/android
         env:
           ANDROID_HOME: /usr/local/lib/android/sdk

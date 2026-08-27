@@ -68,7 +68,7 @@ export default function PaywallScreen() {
     setError('');
 
     try {
-      const originUrl = window.location.origin;
+      const originUrl = Platform.OS === 'web' ? window.location.origin : 'wreckless://app';
 
       const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/payments/create-checkout`, {
         method: 'POST',
