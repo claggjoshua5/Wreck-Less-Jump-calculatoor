@@ -26,7 +26,6 @@ jobs:
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/share/swift
           sudo rm -rf /usr/local/.ghcup
-          sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
           sudo rm -rf /opt/hostedtoolcache/CodeQL
           sudo rm -rf /usr/local/share/boost
@@ -75,12 +74,12 @@ jobs:
         timeout-minutes: 20
         working-directory: frontend/android
         env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
           GRADLE_OPTS: '-Dorg.gradle.jvmargs="-Xmx2048m -XX:MaxMetaspaceSize=512m" -Dorg.gradle.daemon=false'
         run: |
           ./gradlew assembleDebug \
             --stacktrace \
             --build-cache \
-            --configuration-cache \
             -x test \
             -x lint \
             --no-watch-fs \
