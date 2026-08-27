@@ -145,7 +145,7 @@ export default function MeasureScreen() {
     }
 
     const result = await ImagePicker.launchCameraAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      mediaTypes: ImagePicker.MediaType.images,
       quality: 0.8,
       allowsEditing: false,
     });
