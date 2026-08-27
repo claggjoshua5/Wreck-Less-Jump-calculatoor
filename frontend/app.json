@@ -35,6 +35,7 @@
       "favicon": "./assets/images/favicon.png"
     },
     "plugins": [
+      ["./plugins/withAbiFilters", { "abiFilters": ["arm64-v8a"] }],
       "expo-router",
       [
         "expo-location",
