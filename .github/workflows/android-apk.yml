@@ -56,13 +56,38 @@ jobs:
           java-version: "17"
           cache: gradle
 
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            frontend/android/.gradle
+          key: ${{ runner.os }}-gradle-${{ hashFiles('frontend/android/gradle/wrapper/gradle-wrapper.properties', 'frontend/android/build.gradle', 'frontend/android/app/build.gradle') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
       - name: Ensure gradlew is executable
         working-directory: frontend/android
         run: chmod +x ./gradlew
 
       - name: Build debug APK
+        timeout-minutes: 20
         working-directory: frontend/android
-        run: ./gradlew assembleDebug --stacktrace --no-build-cache --no-daemon -x test --max-workers=2
+        env:
+          GRADLE_OPTS: '-Dorg.gradle.jvmargs="-Xmx2048m -XX:MaxMetaspaceSize=512m" -Dorg.gradle.daemon=false'
+        run: |
+          ./gradlew assembleDebug \
+            --stacktrace \
+            --build-cache \
+            --configuration-cache \
+            -x test \
+            -x lint \
+            --no-watch-fs \
+            -Dorg.gradle.parallel=true \
+            -Dorg.gradle.workers.max=4 \
+            -Dorg.gradle.caching=true \
+            -Dkotlin.compiler.execution.strategy=in-process
 
       - name: Debug - List all APK files
         if: always()
