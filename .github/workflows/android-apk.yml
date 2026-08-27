@@ -80,7 +80,6 @@ jobs:
           ./gradlew assembleDebug \
             --stacktrace \
             --build-cache \
-            --configuration-cache \
             -x test \
             -x lint \
             --no-watch-fs \
