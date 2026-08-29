@@ -225,6 +225,9 @@ frontend:
       - working: false
         agent: "main"
         comment: "Applied a second startup mitigation: removed startup-time splash/subscription blocking and deferred the Viro AR module load until the Measure screen explicitly enters AR mode, because startup-time native AR initialization remained a likely Android release blocker."
+      - working: false
+        agent: "main"
+        comment: "Brought the previously isolated Expo Router root redirect into the active Android build branch by adding `frontend/app/index.tsx` so the app root route resolves directly into `/(tabs)` instead of relying on an implicit startup path."
 
 metadata:
   created_by: "main_agent"
