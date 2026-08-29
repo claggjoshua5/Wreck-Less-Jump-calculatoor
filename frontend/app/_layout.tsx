@@ -1,17 +1,11 @@
 import React, { useState, useEffect, createContext, useContext } from 'react';
 import { Stack } from 'expo-router';
 import { Platform } from 'react-native';
-import * as SplashScreen from 'expo-splash-screen';
 import {
   fetchJsonWithBackend,
   isBackendConfigured,
   TrialInfo,
 } from '@/lib/appSupport';
-
-// Keep the splash screen visible until we finish initialization
-SplashScreen.preventAutoHideAsync().catch(() => {
-  // If preventAutoHideAsync fails (e.g., already hidden), ignore it
-});
 
 interface SubscriptionContextType {
   isSubscribed: boolean;
@@ -78,8 +72,8 @@ const getDeviceId = async (): Promise<string> => {
 };
 
 export default function RootLayout() {
-  const [isSubscribed, setIsSubscribed] = useState(false);
-  const [isLoading, setIsLoading] = useState(true);
+  const [isSubscribed, setIsSubscribed] = useState(true);
+  const [isLoading] = useState(false);
   const [deviceId, setDeviceId] = useState('');
   const [isTrial, setIsTrial] = useState(false);
   const [trialInfo, setTrialInfo] = useState<TrialInfo | null>(null);
@@ -114,24 +108,11 @@ export default function RootLayout() {
       setIsTrial(false);
       setTrialInfo(null);
       setStatusMessage('Offline mode enabled');
-    } finally {
-      setIsLoading(false);
-      SplashScreen.hideAsync().catch(() => {
-        // Ignore errors if splash screen is already hidden
-      });
     }
   };
 
   useEffect(() => {
     checkSubscription();
-
-    // Safety timeout: hide splash after 5 s regardless of initialization state
-    const timer = setTimeout(() => {
-      SplashScreen.hideAsync().catch(() => {});
-      setIsLoading(false);
-    }, 5000);
-
-    return () => clearTimeout(timer);
   }, []);
 
   const setSubscribed = (value: boolean) => {

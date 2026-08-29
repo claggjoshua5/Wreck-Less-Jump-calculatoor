@@ -51,8 +51,10 @@ export default function TabLayout() {
       )}
       
       <Tabs
+        initialRouteName="index"
         screenOptions={{
           headerShown: false,
+          lazy: true,
           tabBarStyle: {
             backgroundColor: '#1A1A1A',
             borderTopColor: '#333',
