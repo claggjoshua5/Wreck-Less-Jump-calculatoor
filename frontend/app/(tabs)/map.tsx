@@ -14,24 +14,15 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
 import * as Location from 'expo-location';
-import Svg, { Circle, Path, G, Text as SvgText, Rect, Line } from 'react-native-svg';
+import Svg, { Circle, G, Text as SvgText, Rect, Line } from 'react-native-svg';
+import {
+  fetchJsonWithBackend,
+  isBackendConfigured,
+  listMapLocationsLocally,
+  MapLocation,
+} from '@/lib/appSupport';
 
-const EXPO_PUBLIC_BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL;
-const { width, height } = Dimensions.get('window');
-
-interface MapLocation {
-  id: string;
-  name: string;
-  latitude: number;
-  longitude: number;
-  address?: string;
-  is_shared: boolean;
-  share_code?: string;
-  required_speed_mph: number;
-  gap_distance: number;
-  ramp_angle: number;
-  created_at: string;
-}
+const { width } = Dimensions.get('window');
 
 export default function MapScreen() {
   const [locations, setLocations] = useState<MapLocation[]>([]);
@@ -44,9 +35,18 @@ export default function MapScreen() {
 
   const fetchLocations = async () => {
     try {
-      const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/map-locations`);
-      if (!response.ok) throw new Error('Failed to fetch locations');
-      const data = await response.json();
+      let data: MapLocation[];
+
+      if (isBackendConfigured) {
+        try {
+          data = await fetchJsonWithBackend<MapLocation[]>('/api/map-locations');
+        } catch {
+          data = await listMapLocationsLocally();
+        }
+      } else {
+        data = await listMapLocationsLocally();
+      }
+
       setLocations(data);
       
       // Center map on locations if available

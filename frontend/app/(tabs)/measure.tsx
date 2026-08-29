@@ -17,7 +17,6 @@ import { Ionicons } from '@expo/vector-icons';
 import { Accelerometer } from 'expo-sensors';
 import * as ImagePicker from 'expo-image-picker';
 import Svg, { Circle, Line, Rect } from 'react-native-svg';
-import ARMeasureView from '../../components/ARMeasureView';
 
 const { width } = Dimensions.get('window');
 
@@ -38,10 +37,16 @@ interface Measurements {
 }
 
 type MeasureMode = 'ar' | 'sensor' | 'photo';
+type ARMeasureViewProps = {
+  onMeasurement: (type: 'rampAngle' | 'rampHeight' | 'gapDistance', value: number) => void;
+  onClose: () => void;
+};
 
 export default function MeasureScreen() {
   // Mode state
-  const [mode, setMode] = useState<MeasureMode>('ar');
+  const [mode, setMode] = useState<MeasureMode>('sensor');
+  const [ARMeasureView, setARMeasureView] = useState<React.ComponentType<ARMeasureViewProps> | null>(null);
+  const [arLoadError, setArLoadError] = useState(false);
 
   // Angle measurement states
   const [isCalibrating, setIsCalibrating] = useState(false);
@@ -145,7 +150,7 @@ export default function MeasureScreen() {
     }
 
     const result = await ImagePicker.launchCameraAsync({
-      mediaTypes: ImagePicker.MediaType.images,
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
       quality: 0.8,
       allowsEditing: false,
     });
@@ -325,6 +330,22 @@ export default function MeasureScreen() {
     );
   };
 
+  useEffect(() => {
+    if (mode !== 'ar' || ARMeasureView) {
+      return;
+    }
+
+    try {
+      const arModule = require('../../components/ARMeasureView');
+      setARMeasureView(() => arModule.default as React.ComponentType<ARMeasureViewProps>);
+      setArLoadError(false);
+    } catch (error) {
+      console.error('Failed to load AR measurement view:', error);
+      setArLoadError(true);
+      setMode('sensor');
+    }
+  }, [ARMeasureView, mode]);
+
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar style="light" />
@@ -364,10 +385,27 @@ export default function MeasureScreen() {
         {/* AR Mode */}
         {mode === 'ar' && (
           <View style={styles.section}>
-            <ARMeasureView
-              onMeasurement={handleARMeasurement}
-              onClose={() => setMode('sensor')}
-            />
+            {ARMeasureView ? (
+              <ARMeasureView
+                onMeasurement={handleARMeasurement}
+                onClose={() => setMode('sensor')}
+              />
+            ) : (
+              <View style={styles.arUnavailable}>
+                <Ionicons name="scan" size={32} color="#FF6B35" />
+                <Text style={styles.arUnavailableTitle}>Loading AR Tools…</Text>
+                <Text style={styles.arUnavailableText}>
+                  If AR does not load, use Sensor or Photo mode instead.
+                </Text>
+              </View>
+            )}
+          </View>
+        )}
+
+        {arLoadError && (
+          <View style={styles.savedMeasurement}>
+            <Ionicons name="warning" size={16} color="#FF9800" />
+            <Text style={styles.savedText}>AR mode was unavailable on this device, so Sensor mode was opened instead.</Text>
           </View>
         )}
 
@@ -481,7 +519,7 @@ export default function MeasureScreen() {
                 />
                 <Text style={[
                   styles.calibrationText,
-                  pixelsPerInch && styles.calibrationTextActive
+                  pixelsPerInch ? styles.calibrationTextActive : null
                 ]}>
                   {pixelsPerInch ? 'Credit card calibrated' : 'Mark credit card edges'}
                 </Text>
@@ -511,7 +549,7 @@ export default function MeasureScreen() {
                   ]}
                   onPress={() => startMeasurement('gap')}
                 >
-                  <Ionicons name="resize-horizontal" size={18} color="#fff" />
+                  <Ionicons name="resize" size={18} color="#fff" />
                   <Text style={styles.measureButtonText}>
                     {measurements.gapDistance !== null ? `${measurements.gapDistance} ft` : 'Gap Distance'}
                   </Text>
@@ -750,6 +788,29 @@ const styles = StyleSheet.create({
     color: '#4CAF50',
     fontSize: 14,
     fontWeight: '600',
+  },
+  arUnavailable: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 32,
+    paddingHorizontal: 20,
+    borderRadius: 16,
+    backgroundColor: '#181818',
+    borderWidth: 1,
+    borderColor: '#2A2A2A',
+    gap: 8,
+  },
+  arUnavailableTitle: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: '700',
+    textAlign: 'center',
+  },
+  arUnavailableText: {
+    color: '#aaa',
+    fontSize: 14,
+    textAlign: 'center',
+    lineHeight: 20,
   },
   photoContainer: {
     marginTop: 8,

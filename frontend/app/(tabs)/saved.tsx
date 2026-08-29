@@ -16,39 +16,17 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
+import {
+  deleteCalculationLocally,
+  fetchJsonWithBackend,
+  isBackendConfigured,
+  listSavedCalculationsLocally,
+  lookupSharedCalculationLocally,
+  SavedCalculation,
+  shareCalculationLocally,
+} from '@/lib/appSupport';
 
-const EXPO_PUBLIC_BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL;
 const { width } = Dimensions.get('window');
-
-interface SavedCalculation {
-  id: string;
-  name: string;
-  description?: string;
-  calculation: {
-    input_data: {
-      ramp_angle: number;
-      gap_distance: number;
-      bike_weight: number;
-      rider_weight: number;
-      unit_system: string;
-    };
-    required_speed_mph: number;
-    required_speed_kph: number;
-    safety_speed_mph: number;
-    safety_speed_kph: number;
-    flight_time_seconds: number;
-    max_height_feet: number;
-    max_height_meters: number;
-  };
-  location?: {
-    latitude: number;
-    longitude: number;
-    address?: string;
-  };
-  is_shared: boolean;
-  share_code?: string;
-  created_at: string;
-}
 
 export default function SavedScreen() {
   const [calculations, setCalculations] = useState<SavedCalculation[]>([]);
@@ -61,9 +39,18 @@ export default function SavedScreen() {
 
   const fetchCalculations = async () => {
     try {
-      const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/saved-calculations`);
-      if (!response.ok) throw new Error('Failed to fetch calculations');
-      const data = await response.json();
+      let data: SavedCalculation[];
+
+      if (isBackendConfigured) {
+        try {
+          data = await fetchJsonWithBackend<SavedCalculation[]>('/api/saved-calculations');
+        } catch {
+          data = await listSavedCalculationsLocally();
+        }
+      } else {
+        data = await listSavedCalculationsLocally();
+      }
+
       setCalculations(data);
     } catch (error) {
       console.error('Error fetching calculations:', error);
@@ -93,12 +80,19 @@ export default function SavedScreen() {
           style: 'destructive',
           onPress: async () => {
             try {
-              const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/saved-calculation/${id}`, {
-                method: 'DELETE',
-              });
-              if (!response.ok) throw new Error('Failed to delete');
+              if (isBackendConfigured) {
+                try {
+                  await fetchJsonWithBackend(`/api/saved-calculation/${id}`, {
+                    method: 'DELETE',
+                  });
+                } catch {
+                  await deleteCalculationLocally(id);
+                }
+              } else {
+                await deleteCalculationLocally(id);
+              }
               setCalculations(calculations.filter(c => c.id !== id));
-            } catch (error) {
+            } catch {
               Alert.alert('Error', 'Failed to delete calculation');
             }
           },
@@ -114,16 +108,31 @@ export default function SavedScreen() {
     } else {
       // Generate share code first
       try {
-        const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/share-calculation/${calc.id}`, {
-          method: 'POST',
-        });
-        if (!response.ok) throw new Error('Failed to share');
-        const data = await response.json();
-        calc.share_code = data.share_code;
+        const sharedCalculation = isBackendConfigured
+          ? await (async () => {
+              try {
+                const data = await fetchJsonWithBackend<{ share_code: string }>(
+                  `/api/share-calculation/${calc.id}`,
+                  {
+                    method: 'POST',
+                  }
+                );
+                return {
+                  ...calc,
+                  share_code: data.share_code,
+                  is_shared: true,
+                };
+              } catch {
+                return shareCalculationLocally(calc.id);
+              }
+            })()
+          : await shareCalculationLocally(calc.id);
+
+        calc.share_code = sharedCalculation.share_code;
         calc.is_shared = true;
         setCalculations([...calculations]);
         await shareCode(calc);
-      } catch (error) {
+      } catch {
         Alert.alert('Error', 'Failed to generate share code');
       }
     }
@@ -148,15 +157,28 @@ export default function SavedScreen() {
 
     setIsLookingUp(true);
     try {
-      const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/shared/${lookupCode.toUpperCase()}`);
-      if (!response.ok) {
+      let data: SavedCalculation | null;
+
+      if (isBackendConfigured) {
+        try {
+          data = await fetchJsonWithBackend<SavedCalculation>(
+            `/api/shared/${lookupCode.toUpperCase()}`
+          );
+        } catch {
+          data = await lookupSharedCalculationLocally(lookupCode);
+        }
+      } else {
+        data = await lookupSharedCalculationLocally(lookupCode);
+      }
+
+      if (!data) {
         throw new Error('Calculation not found');
       }
-      const data = await response.json();
+
       setSelectedCalc(data);
       setShowLookupModal(false);
       setLookupCode('');
-    } catch (error) {
+    } catch {
       Alert.alert('Not Found', 'No calculation found with that share code.');
     } finally {
       setIsLookingUp(false);

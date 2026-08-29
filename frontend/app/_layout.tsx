@@ -1,21 +1,11 @@
 import React, { useState, useEffect, createContext, useContext } from 'react';
 import { Stack } from 'expo-router';
 import { Platform } from 'react-native';
-import * as SplashScreen from 'expo-splash-screen';
-
-// Keep the splash screen visible until we finish initialization
-SplashScreen.preventAutoHideAsync().catch(() => {
-  // If preventAutoHideAsync fails (e.g., already hidden), ignore it
-});
-
-const EXPO_PUBLIC_BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL;
-
-interface TrialInfo {
-  is_trial_active: boolean;
-  trial_started_at?: string;
-  trial_expires_at?: string;
-  trial_days_remaining?: number;
-}
+import {
+  fetchJsonWithBackend,
+  isBackendConfigured,
+  TrialInfo,
+} from '@/lib/appSupport';
 
 interface SubscriptionContextType {
   isSubscribed: boolean;
@@ -82,8 +72,8 @@ const getDeviceId = async (): Promise<string> => {
 };
 
 export default function RootLayout() {
-  const [isSubscribed, setIsSubscribed] = useState(false);
-  const [isLoading, setIsLoading] = useState(true);
+  const [isSubscribed, setIsSubscribed] = useState(true);
+  const [isLoading] = useState(false);
   const [deviceId, setDeviceId] = useState('');
   const [isTrial, setIsTrial] = useState(false);
   const [trialInfo, setTrialInfo] = useState<TrialInfo | null>(null);
@@ -94,36 +84,35 @@ export default function RootLayout() {
       const id = await getDeviceId();
       setDeviceId(id);
       
-      const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/subscription/status/${id}`);
-      if (response.ok) {
-        const data = await response.json();
-        setIsSubscribed(data.is_active);
-        setIsTrial(data.is_trial || false);
-        setTrialInfo(data.trial_info || null);
-        setStatusMessage(data.status_message || '');
+      if (!isBackendConfigured) {
+        setIsSubscribed(true);
+        setIsTrial(false);
+        setTrialInfo(null);
+        setStatusMessage('Offline mode enabled');
+        return;
       }
+
+      const data = await fetchJsonWithBackend<{
+        is_active: boolean;
+        is_trial?: boolean;
+        trial_info?: TrialInfo | null;
+        status_message?: string;
+      }>(`/api/subscription/status/${id}`);
+      setIsSubscribed(Boolean(data.is_active));
+      setIsTrial(Boolean(data.is_trial));
+      setTrialInfo(data.trial_info ?? null);
+      setStatusMessage(data.status_message ?? '');
     } catch (error) {
       console.error('Error checking subscription:', error);
-      // On error, allow access (graceful degradation)
       setIsSubscribed(true);
-    } finally {
-      setIsLoading(false);
-      SplashScreen.hideAsync().catch(() => {
-        // Ignore errors if splash screen is already hidden
-      });
+      setIsTrial(false);
+      setTrialInfo(null);
+      setStatusMessage('Offline mode enabled');
     }
   };
 
   useEffect(() => {
     checkSubscription();
-
-    // Safety timeout: hide splash after 5 s regardless of initialization state
-    const timer = setTimeout(() => {
-      SplashScreen.hideAsync().catch(() => {});
-      setIsLoading(false);
-    }, 5000);
-
-    return () => clearTimeout(timer);
   }, []);
 
   const setSubscribed = (value: boolean) => {
