@@ -45,6 +45,11 @@ jobs:
         run: npm ci
 
       - name: Prebuild Android
+        # The withAbiFilters config plugin (frontend/plugins/withAbiFilters.js)
+        # injects ndk { abiFilters "arm64-v8a" } into app/build.gradle here.
+        # This keeps the ABI restriction in source rather than patching files
+        # post-hoc. For release builds, update the plugin options to include
+        # all required ABIs or remove the plugin entirely.
         working-directory: frontend
         run: CI=1 npx expo prebuild --platform android --no-install
 
@@ -55,15 +60,22 @@ jobs:
           java-version: "17"
           cache: gradle
 
-      - name: Cache Gradle dependencies
+      - name: Cache Gradle and NDK build outputs
         uses: actions/cache@v4
         with:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
             frontend/android/.gradle
-          key: ${{ runner.os }}-gradle-${{ hashFiles('frontend/android/gradle/wrapper/gradle-wrapper.properties', 'frontend/android/build.gradle', 'frontend/android/app/build.gradle') }}
+            # Cache compiled C++ objects so react-native-reanimated/worklets
+            # native compilation is skipped on cache hits, dramatically
+            # reducing build time on subsequent runs.
+            frontend/android/app/.cxx
+            frontend/android/app/build/intermediates/cmake
+            frontend/android/app/build/intermediates/cxx
+          key: ${{ runner.os }}-gradle-ndk-${{ hashFiles('frontend/android/gradle/wrapper/gradle-wrapper.properties', 'frontend/android/build.gradle', 'frontend/android/app/build.gradle', 'frontend/package-lock.json') }}
           restore-keys: |
+            ${{ runner.os }}-gradle-ndk-
             ${{ runner.os }}-gradle-
 
       - name: Ensure gradlew is executable
@@ -71,6 +83,16 @@ jobs:
         run: chmod +x ./gradlew
 
       - name: Build debug APK
+        # 60 minutes: cold C++ build for a single ABI (arm64-v8a) typically
+        # takes 12-18 minutes on GitHub runners. 60 min gives ample headroom.
+        # ABI is restricted to arm64-v8a via the withAbiFilters config plugin
+        # applied during prebuild — this is a debug/CI build only constraint.
+        timeout-minutes: 60
+        working-directory: frontend/android
+        env:
+          # 3072m heap: leaves ~4GB headroom for OS + parallel workers on a
+          # ~7GB runner. G1GC reduces pause times under memory pressure.
+          GRADLE_OPTS: '-Dorg.gradle.jvmargs="-Xmx3072m -XX:MaxMetaspaceSize=512m -XX:+UseG1GC" -Dorg.gradle.daemon=false'
         timeout-minutes: 45
         working-directory: frontend/android
         env:
