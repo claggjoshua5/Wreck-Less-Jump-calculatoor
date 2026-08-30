@@ -20,47 +20,17 @@ import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
 import Svg, { Path, Circle, Line, Text as SvgText, G, Polygon } from 'react-native-svg';
 import * as Location from 'expo-location';
+import {
+  calculateJumpLocally,
+  CalculationResult,
+  fetchJsonWithBackend,
+  isBackendConfigured,
+  JumpCalculationInput,
+  LocationData,
+  saveCalculationLocally,
+} from '@/lib/appSupport';
 
-const EXPO_PUBLIC_BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL;
 const { width } = Dimensions.get('window');
-
-interface TrajectoryPoint {
-  x: number;
-  y: number;
-  time: number;
-}
-
-interface CalculationResult {
-  id: string;
-  input_data: {
-    ramp_height: number;
-    ramp_angle: number;
-    gap_distance: number;
-    bike_weight: number;
-    rider_weight: number;
-    landing_height: number;
-    unit_system: string;
-  };
-  required_speed_mph: number;
-  required_speed_kph: number;
-  safety_speed_mph: number;
-  safety_speed_kph: number;
-  total_weight_lbs: number;
-  total_weight_kg: number;
-  flight_time_seconds: number;
-  max_height_feet: number;
-  max_height_meters: number;
-  landing_velocity_mph: number;
-  landing_velocity_kph: number;
-  trajectory_points: TrajectoryPoint[];
-  warnings: string[];
-}
-
-interface LocationData {
-  latitude: number;
-  longitude: number;
-  address?: string;
-}
 
 export default function Index() {
   // Input states
@@ -87,28 +57,34 @@ export default function Index() {
   const [isSaving, setIsSaving] = useState(false);
   const [currentLocation, setCurrentLocation] = useState<LocationData | null>(null);
 
-  // Request location permission on mount
-  useEffect(() => {
-    (async () => {
+  const loadCurrentLocation = async () => {
+    try {
       const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status === 'granted') {
-        try {
-          const location = await Location.getCurrentPositionAsync({});
-          const address = await Location.reverseGeocodeAsync({
-            latitude: location.coords.latitude,
-            longitude: location.coords.longitude,
-          });
-          setCurrentLocation({
-            latitude: location.coords.latitude,
-            longitude: location.coords.longitude,
-            address: address[0] ? `${address[0].city || ''}, ${address[0].region || ''}` : undefined,
-          });
-        } catch (error) {
-          console.log('Error getting location:', error);
-        }
+      if (status !== 'granted') {
+        setCurrentLocation(null);
+        return null;
       }
-    })();
-  }, []);
+
+      const location = await Location.getCurrentPositionAsync({});
+      const address = await Location.reverseGeocodeAsync({
+        latitude: location.coords.latitude,
+        longitude: location.coords.longitude,
+      });
+      const nextLocation = {
+        latitude: location.coords.latitude,
+        longitude: location.coords.longitude,
+        address: address[0]
+          ? `${address[0].city || ''}${address[0].city && address[0].region ? ', ' : ''}${address[0].region || ''}`
+          : undefined,
+      };
+      setCurrentLocation(nextLocation);
+      return nextLocation;
+    } catch (error) {
+      console.log('Error getting location:', error);
+      setCurrentLocation(null);
+      return null;
+    }
+  };
 
   // Animation effect
   useEffect(() => {
@@ -130,7 +106,7 @@ export default function Index() {
       
       requestAnimationFrame(animate);
     }
-  }, [isAnimating]);
+  }, [isAnimating, result]);
 
   const validateInputs = (): boolean => {
     if (!rampAngle || !gapDistance || !bikeWeight || !riderWeight) {
@@ -160,28 +136,34 @@ export default function Index() {
     setResult(null);
 
     try {
-      const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/calculate-jump`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          ramp_height: parseFloat(rampHeight) || 0,
-          ramp_angle: parseFloat(rampAngle),
-          gap_distance: parseFloat(gapDistance),
-          bike_weight: parseFloat(bikeWeight),
-          rider_weight: parseFloat(riderWeight),
-          landing_height: parseFloat(landingHeight) || 0,
-          unit_system: useMetric ? 'metric' : 'imperial',
-        }),
-      });
+      const inputData: JumpCalculationInput = {
+        ramp_height: parseFloat(rampHeight) || 0,
+        ramp_angle: parseFloat(rampAngle),
+        gap_distance: parseFloat(gapDistance),
+        bike_weight: parseFloat(bikeWeight),
+        rider_weight: parseFloat(riderWeight),
+        landing_height: parseFloat(landingHeight) || 0,
+        unit_system: useMetric ? 'metric' : 'imperial',
+      };
 
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || 'Calculation failed');
+      let data: CalculationResult;
+
+      if (isBackendConfigured) {
+        try {
+          data = await fetchJsonWithBackend<CalculationResult>('/api/calculate-jump', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(inputData),
+          });
+        } catch {
+          data = calculateJumpLocally(inputData);
+        }
+      } else {
+        data = calculateJumpLocally(inputData);
       }
 
-      const data = await response.json();
       setResult(data);
       // Start animation
       setAnimationProgress(0);
@@ -205,6 +187,11 @@ export default function Index() {
   };
 
   const handleSave = async () => {
+    if (!result) {
+      Alert.alert('Error', 'Run a calculation before saving.');
+      return;
+    }
+
     if (!saveName.trim()) {
       Alert.alert('Error', 'Please enter a name for this calculation.');
       return;
@@ -212,36 +199,51 @@ export default function Index() {
 
     setIsSaving(true);
     try {
-      const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/save-calculation`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: saveName,
-          description: saveDescription,
-          calculation: result,
-          location: includeLocation ? currentLocation : null,
-          share: shareCalculation,
-        }),
-      });
+      const locationToSave =
+        includeLocation && !currentLocation
+          ? await loadCurrentLocation()
+          : currentLocation;
+      const payload = {
+        name: saveName,
+        description: saveDescription,
+        calculation: result,
+        location: includeLocation ? locationToSave : null,
+        share: shareCalculation,
+      };
 
-      if (!response.ok) {
-        throw new Error('Failed to save calculation');
+      let savedData: { share_code?: string };
+
+      if (isBackendConfigured) {
+        try {
+          savedData = await fetchJsonWithBackend<{ share_code?: string }>(
+            '/api/save-calculation',
+            {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(payload),
+            }
+          );
+        } catch {
+          savedData = await saveCalculationLocally(payload);
+        }
+      } else {
+        savedData = await saveCalculationLocally(payload);
       }
-
-      const savedData = await response.json();
       
       setShowSaveModal(false);
       setSaveName('');
       setSaveDescription('');
       
-      if (shareCalculation && savedData.share_code) {
+      const shareCode = savedData.share_code;
+
+      if (shareCalculation && shareCode) {
         Alert.alert(
           'Saved & Shared!',
-          `Your calculation has been saved.\n\nShare Code: ${savedData.share_code}`,
+          `Your calculation has been saved.\n\nShare Code: ${shareCode}`,
           [
-            { text: 'Copy Code', onPress: () => handleShareCode(savedData.share_code) },
+            { text: 'Copy Code', onPress: () => handleShareCode(shareCode) },
             { text: 'OK' },
           ]
         );
@@ -280,6 +282,23 @@ export default function Index() {
   const replayAnimation = () => {
     setAnimationProgress(0);
     setIsAnimating(true);
+  };
+
+  const openSaveModal = async () => {
+    setShowSaveModal(true);
+
+    if (includeLocation && !currentLocation) {
+      await loadCurrentLocation();
+    }
+  };
+
+  const toggleIncludeLocation = async () => {
+    const nextValue = !includeLocation;
+    setIncludeLocation(nextValue);
+
+    if (nextValue && !currentLocation) {
+      await loadCurrentLocation();
+    }
   };
 
   const distanceUnit = useMetric ? 'm' : 'ft';
@@ -625,7 +644,7 @@ export default function Index() {
                   <TouchableOpacity onPress={handleQuickShare} style={styles.actionButton}>
                     <Ionicons name="share-social" size={20} color="#2196F3" />
                   </TouchableOpacity>
-                  <TouchableOpacity onPress={() => setShowSaveModal(true)} style={styles.actionButton}>
+                  <TouchableOpacity onPress={openSaveModal} style={styles.actionButton}>
                     <Ionicons name="bookmark" size={20} color="#FF6B35" />
                   </TouchableOpacity>
                 </View>
@@ -759,7 +778,7 @@ export default function Index() {
 
               <TouchableOpacity
                 style={styles.optionRow}
-                onPress={() => setIncludeLocation(!includeLocation)}
+                onPress={toggleIncludeLocation}
               >
                 <Ionicons
                   name={includeLocation ? 'checkbox' : 'square-outline'}

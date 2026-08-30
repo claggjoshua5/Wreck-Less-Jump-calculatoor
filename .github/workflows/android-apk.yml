@@ -93,6 +93,11 @@ jobs:
           # 3072m heap: leaves ~4GB headroom for OS + parallel workers on a
           # ~7GB runner. G1GC reduces pause times under memory pressure.
           GRADLE_OPTS: '-Dorg.gradle.jvmargs="-Xmx3072m -XX:MaxMetaspaceSize=512m -XX:+UseG1GC" -Dorg.gradle.daemon=false'
+        timeout-minutes: 45
+        working-directory: frontend/android
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          GRADLE_OPTS: '-Dorg.gradle.jvmargs="-Xmx2048m -XX:MaxMetaspaceSize=512m" -Dorg.gradle.daemon=false'
         run: |
           ./gradlew assembleDebug \
             --stacktrace \
