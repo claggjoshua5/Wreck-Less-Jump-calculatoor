@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import {
   View,
   Text,
@@ -24,26 +24,6 @@ import {
 
 const { width: screenWidth } = Dimensions.get('window');
 const METERS_TO_FEET = 3.28084;
-
-// Define materials for AR objects
-try {
-  ViroMaterials.createMaterials({
-    markerStart: {
-      diffuseColor: '#4CAF50',
-      lightingModel: 'Constant',
-    },
-    markerEnd: {
-      diffuseColor: '#FF6B35',
-      lightingModel: 'Constant',
-    },
-    measureLine: {
-      diffuseColor: '#FFEB3B',
-      lightingModel: 'Constant',
-    },
-  });
-} catch (e) {
-  // Materials may already be created
-}
 
 type MeasureType = 'gap' | 'height' | 'angle';
 type Viro3DPoint = [number, number, number];
@@ -165,6 +145,31 @@ export default function ARMeasureView({ onMeasurement, onClose }: Props) {
     angle: number;
   } | null>(null);
   const latestHitPos = useRef<Viro3DPoint | null>(null);
+
+  useEffect(() => {
+    if (!arActive) {
+      return;
+    }
+
+    try {
+      ViroMaterials.createMaterials({
+        markerStart: {
+          diffuseColor: '#4CAF50',
+          lightingModel: 'Constant',
+        },
+        markerEnd: {
+          diffuseColor: '#FF6B35',
+          lightingModel: 'Constant',
+        },
+        measureLine: {
+          diffuseColor: '#FFEB3B',
+          lightingModel: 'Constant',
+        },
+      });
+    } catch (error) {
+      console.warn('AR materials unavailable or already initialized', error);
+    }
+  }, [arActive]);
 
   // Helpers
   const getTypeLabel = (type: MeasureType) => {
@@ -350,7 +355,7 @@ export default function ARMeasureView({ onMeasurement, onClose }: Props) {
     <Modal visible={arActive} animationType="slide" statusBarTranslucent>
       <View style={styles.arContainer}>
         <ViroARSceneNavigator
-          initialScene={{ scene: ARMeasureScene }}
+          initialScene={{ scene: ARMeasureScene as unknown as () => React.ReactElement }}
           viroAppProps={{
             markers,
             onHitTestUpdate: (pos: Viro3DPoint) => {
