@@ -36,6 +36,18 @@
         {
           "locationAlwaysAndWhenInUsePermission": "Allow Wreck-Less to track your jump speed in the background."
         }
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/images/splash-image.png",
+          "imageWidth": 200,
+          "resizeMode": "contain",
+          "backgroundColor": "#000"
+        }
+      ],
+      "expo-web-browser",
+      "@reactvision/react-viro"
       ]
     ],
     "extra": {
