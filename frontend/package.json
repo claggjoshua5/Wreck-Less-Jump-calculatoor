@@ -8,7 +8,10 @@
     "android": "expo run:android",
     "ios": "expo run:ios",
     "web": "expo start --web",
-    "lint": "expo lint"
+    "lint": "expo lint",
+    "build:apk": "eas build --platform android --profile preview --local",
+    "build:apk:cloud": "eas build --platform android --profile preview",
+    "build:apk:debug": "eas build --platform android --profile development"
   },
   "dependencies": {
     "@babel/runtime": "^7.20.6",
@@ -20,8 +23,8 @@
     "@react-navigation/elements": "^2.3.8",
     "@react-navigation/native": "^7.1.6",
     "@react-navigation/native-stack": "^7.3.10",
-    "@reactvision/react-viro": "^2.54.0",
-    "expo": "54.0.33",
+    "@reactvision/react-viro": "2.54.0",
+    "expo": "57.0.17",
     "expo-blur": "~15.0.8",
     "expo-camera": "~17.0.10",
     "expo-constants": "~18.0.13",
@@ -61,5 +64,5 @@
     "typescript": "~5.9.3"
   },
   "private": true,
-  "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"
+  "packageManager": "npm@11.17.0"
 }

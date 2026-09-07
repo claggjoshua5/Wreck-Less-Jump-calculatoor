@@ -1,63 +1,46 @@
 {
   "expo": {
-    "name": "Wreck-Less Jump Calculator",
-    "slug": "wreck-less-jump-calculator",
+    "name": "Wreck-Less",
+    "slug": "Wreck-Less-Jump-calculatoor",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/images/icon-1024.png",
-    "scheme": "wreckless",
-    "userInterfaceStyle": "automatic",
-    "newArchEnabled": true,
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#121212"
+    },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.joshandheather.wrecklessjumpcalculator",
-      "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "Tag your jump locations on the map",
-        "NSCameraUsageDescription": "Take photos to measure ramp dimensions"
-      }
+      "bundleIdentifier": "com.claggjoshua.wreckless"
     },
     "android": {
-      "package": "com.joshandheather.wrecklessjumpcalculator",
       "adaptiveIcon": {
-        "foregroundImage": "./assets/images/adaptive-icon.png",
-        "backgroundColor": "#000000"
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#121212"
       },
-      "edgeToEdgeEnabled": true,
+      "package": "com.claggjoshua.wreckless",
       "permissions": [
         "ACCESS_FINE_LOCATION",
         "ACCESS_COARSE_LOCATION",
-        "CAMERA"
+        "ACCESS_BACKGROUND_LOCATION",
+        "WAKE_LOCK",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_LOCATION"
       ]
     },
-    "web": {
-      "bundler": "metro",
-      "output": "static",
-      "favicon": "./assets/images/favicon.png"
-    },
     "plugins": [
-      "expo-router",
       [
         "expo-location",
         {
-          "locationAlwaysAndWhenInUsePermission": "Tag your jump locations on the map"
-        }
-      ],
-      [
-        "expo-camera",
-        {
-          "cameraPermission": "Take photos to measure ramp dimensions"
-        }
-      ],
-      [
-        "expo-image-picker",
-        {
-          "cameraPermission": "Take photos to measure ramp dimensions"
+          "locationAlwaysAndWhenInUsePermission": "Allow Wreck-Less to track your jump speed in the background."
         }
       ],
       [
         "expo-splash-screen",
         {
-          "image": "./assets/images/splash-icon.png",
+          "image": "./assets/images/splash-image.png",
           "imageWidth": 200,
           "resizeMode": "contain",
           "backgroundColor": "#000"
@@ -65,9 +48,12 @@
       ],
       "expo-web-browser",
       "@reactvision/react-viro"
+      ]
     ],
-    "experiments": {
-      "typedRoutes": true
+    "extra": {
+      "eas": {
+        "projectId": "your-project-id"
+      }
     }
   }
 }
