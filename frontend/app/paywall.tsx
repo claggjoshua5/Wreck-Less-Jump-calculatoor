@@ -9,14 +9,19 @@ import {
   ScrollView,
   Image,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import { StatusBar } from 'expo-status-bar';
-import { Ionicons } from '@expo/vector-icons';
-import * as WebBrowser from 'expo-web-browser';
-import { useRouter } from 'expo-router';
-import { useSubscription } from './_layout';
-
-const EXPO_PUBLIC_BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL;
+@@
+-import * as WebBrowser from 'expo-web-browser';
++import * as WebBrowser from 'expo-web-browser';
++import * as Linking from 'expo-linking';
+@@
+-      const originUrl = Platform.OS === 'web' ? window.location.origin : 'wreckless://app';
++      // Use Expo Linking to create a runtime-correct deep link URL.
++      // In a built standalone app this will become "wreckless://..." per app.json scheme,
++      // while in the dev environment it will create a URL handled by the dev client / Expo runtime.
++      const originUrl =
++        Platform.OS === 'web'
++          ? window.location.origin
++          : Linking.createURL(''); // returns the app scheme root for the current runtime
 
 export default function PaywallScreen() {
   const { deviceId, checkSubscription, trialInfo } = useSubscription();

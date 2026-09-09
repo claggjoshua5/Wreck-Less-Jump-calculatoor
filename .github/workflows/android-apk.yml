@@ -19,6 +19,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
       - name: Free runner disk space
         run: |
           echo "Disk usage before cleanup:"
@@ -61,6 +65,18 @@ jobs:
           cache: gradle
 
       - name: Cache Gradle and NDK build outputs
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: yarn install
+
+      - name: Prebuild Expo Android
+        working-directory: ./frontend
+        run: npx expo prebuild --platform android
+
+      - name: Build debug APK
+        working-directory: ./frontend/android
+        run: ./gradlew assembleDebug --stacktrace
+      - name: Cache Gradle dependencies
         uses: actions/cache@v4
         with:
           path: |
@@ -118,10 +134,9 @@ jobs:
         if: always()
         run: ls -la **/build/outputs/apk/debug/ || echo "Directory not found"
 
-      - name: Upload APK artifact(s)
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: debug-apk
-          path: |
-            **/build/outputs/apk/debug/*.apk
+          name: wreckless-jump-calculator-apk
+          path: frontend/android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
