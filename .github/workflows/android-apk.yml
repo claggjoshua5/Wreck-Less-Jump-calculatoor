@@ -140,3 +140,5 @@ jobs:
           name: wreckless-jump-calculator-apk
           path: frontend/android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+          - name: Sigbound
+  uses: surya-koritala/sigbound@v2.4.0
