@@ -73,7 +73,7 @@ const getDeviceId = async (): Promise<string> => {
 
 export default function RootLayout() {
   const [isSubscribed, setIsSubscribed] = useState(true);
-  const [isLoading] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
   const [deviceId, setDeviceId] = useState('');
   const [isTrial, setIsTrial] = useState(false);
   const [trialInfo, setTrialInfo] = useState<TrialInfo | null>(null);
@@ -112,7 +112,11 @@ export default function RootLayout() {
   };
 
   useEffect(() => {
-    checkSubscription();
+    // Initialize device ID immediately without blocking app startup
+    getDeviceId().then(id => setDeviceId(id)).catch(console.error);
+    
+    // Run subscription check in background (non-blocking)
+    checkSubscription().catch(console.error);
   }, []);
 
   const setSubscribed = (value: boolean) => {
