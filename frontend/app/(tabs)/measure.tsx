@@ -15,7 +15,6 @@ import { Ionicons } from '@expo/vector-icons';
 import { Accelerometer } from 'expo-sensors';
 import * as ImagePicker from 'expo-image-picker';
 import Svg, { Circle, Line } from 'react-native-svg';
-import ARMeasureView from '@/components/ARMeasureView';
 
 const { width } = Dimensions.get('window');
 
@@ -33,10 +32,9 @@ interface Measurements {
   landingHeight: number | null;
 }
 
-type MeasureMode = 'ar' | 'sensor' | 'photo';
+type MeasureMode = 'sensor' | 'photo';
 
 export default function MeasureScreen() {
-  // Mode state
   const [mode, setMode] = useState<MeasureMode>('sensor');
 
   // Angle measurement states
@@ -231,17 +229,6 @@ export default function MeasureScreen() {
     setMeasurementMode(null);
   };
 
-  // AR measurement callback
-  const handleARMeasurement = (type: 'rampAngle' | 'rampHeight' | 'gapDistance', value: number) => {
-    if (type === 'rampAngle') {
-      setMeasurements(prev => ({ ...prev, rampAngle: value }));
-    } else if (type === 'rampHeight') {
-      setMeasurements(prev => ({ ...prev, rampHeight: value }));
-    } else if (type === 'gapDistance') {
-      setMeasurements(prev => ({ ...prev, gapDistance: value }));
-    }
-  };
-
   const getModeInstructions = () => {
     switch (measurementMode) {
       case 'card':
@@ -328,13 +315,6 @@ export default function MeasureScreen() {
         {/* Mode Selector */}
         <View style={styles.modeSelector}>
           <TouchableOpacity
-            style={[styles.modeTab, mode === 'ar' && styles.modeTabActive]}
-            onPress={() => setMode('ar')}
-          >
-            <Ionicons name="scan" size={18} color={mode === 'ar' ? '#fff' : '#888'} />
-            <Text style={[styles.modeTabText, mode === 'ar' && styles.modeTabTextActive]}>AR</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
             style={[styles.modeTab, mode === 'sensor' && styles.modeTabActive]}
             onPress={() => setMode('sensor')}
           >
@@ -349,16 +329,6 @@ export default function MeasureScreen() {
             <Text style={[styles.modeTabText, mode === 'photo' && styles.modeTabTextActive]}>Photo</Text>
           </TouchableOpacity>
         </View>
-
-        {/* AR Mode */}
-        {mode === 'ar' && (
-          <View style={styles.section}>
-            <ARMeasureView
-              onMeasurement={handleARMeasurement}
-              onClose={() => setMode('sensor')}
-            />
-          </View>
-        )}
 
         {/* Sensor Mode - Angle Measurement */}
         {mode === 'sensor' && (
