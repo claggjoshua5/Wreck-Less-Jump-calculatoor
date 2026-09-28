@@ -11,10 +11,10 @@
  * Release builds should remove this plugin or extend it to include all ABIs.
  */
 
-const { withAppBuildGradle } = require("@expo/config-plugins");
+const { withAppBuildGradle } = require("expo/config-plugins");
 
 /**
- * @param {import('@expo/config-plugins').ExpoConfig} config
+ * @param {import('expo/config-plugins').ExpoConfig} config
  * @param {{ abiFilters?: string[] }} options
  */
 const withAbiFilters = (config, options = {}) => {
