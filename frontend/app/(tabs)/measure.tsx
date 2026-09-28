@@ -7,23 +7,20 @@ import {
   ScrollView,
   Dimensions,
   Alert,
-  ActivityIndicator,
   Image,
-  Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
 import { Accelerometer } from 'expo-sensors';
 import * as ImagePicker from 'expo-image-picker';
-import Svg, { Circle, Line, Rect } from 'react-native-svg';
+import Svg, { Circle, Line } from 'react-native-svg';
+import ARMeasureView from '@/components/ARMeasureView';
 
 const { width } = Dimensions.get('window');
 
 // Credit card standard dimensions in inches
 const CREDIT_CARD_WIDTH_INCHES = 3.370;
-const CREDIT_CARD_HEIGHT_INCHES = 2.125;
-
 interface MeasurementPoint {
   x: number;
   y: number;
@@ -37,16 +34,10 @@ interface Measurements {
 }
 
 type MeasureMode = 'ar' | 'sensor' | 'photo';
-type ARMeasureViewProps = {
-  onMeasurement: (type: 'rampAngle' | 'rampHeight' | 'gapDistance', value: number) => void;
-  onClose: () => void;
-};
 
 export default function MeasureScreen() {
   // Mode state
   const [mode, setMode] = useState<MeasureMode>('sensor');
-  const [ARMeasureView, setARMeasureView] = useState<React.ComponentType<ARMeasureViewProps> | null>(null);
-  const [arLoadError, setArLoadError] = useState(false);
 
   // Angle measurement states
   const [isCalibrating, setIsCalibrating] = useState(false);
@@ -170,13 +161,6 @@ export default function MeasureScreen() {
     if (!measurementMode || !imageSize) return;
 
     const { locationX, locationY } = event.nativeEvent;
-    const displayWidth = width - 40;
-    const displayHeight = (displayWidth / imageSize.width) * imageSize.height;
-    
-    // Scale coordinates to actual image size
-    const scaleX = imageSize.width / displayWidth;
-    const scaleY = imageSize.height / displayHeight;
-    
     const point: MeasurementPoint = {
       x: locationX,
       y: locationY,
@@ -330,22 +314,6 @@ export default function MeasureScreen() {
     );
   };
 
-  useEffect(() => {
-    if (mode !== 'ar' || ARMeasureView) {
-      return;
-    }
-
-    try {
-      const arModule = require('../../components/ARMeasureView');
-      setARMeasureView(() => arModule.default as React.ComponentType<ARMeasureViewProps>);
-      setArLoadError(false);
-    } catch (error) {
-      console.error('Failed to load AR measurement view:', error);
-      setArLoadError(true);
-      setMode('sensor');
-    }
-  }, [ARMeasureView, mode]);
-
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar style="light" />
@@ -385,27 +353,10 @@ export default function MeasureScreen() {
         {/* AR Mode */}
         {mode === 'ar' && (
           <View style={styles.section}>
-            {ARMeasureView ? (
-              <ARMeasureView
-                onMeasurement={handleARMeasurement}
-                onClose={() => setMode('sensor')}
-              />
-            ) : (
-              <View style={styles.arUnavailable}>
-                <Ionicons name="scan" size={32} color="#FF6B35" />
-                <Text style={styles.arUnavailableTitle}>Loading AR Tools…</Text>
-                <Text style={styles.arUnavailableText}>
-                  If AR does not load, use Sensor or Photo mode instead.
-                </Text>
-              </View>
-            )}
-          </View>
-        )}
-
-        {arLoadError && (
-          <View style={styles.savedMeasurement}>
-            <Ionicons name="warning" size={16} color="#FF9800" />
-            <Text style={styles.savedText}>AR mode was unavailable on this device, so Sensor mode was opened instead.</Text>
+            <ARMeasureView
+              onMeasurement={handleARMeasurement}
+              onClose={() => setMode('sensor')}
+            />
           </View>
         )}
 

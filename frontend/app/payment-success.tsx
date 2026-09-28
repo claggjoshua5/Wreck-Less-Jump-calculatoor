@@ -83,7 +83,7 @@ export default function PaymentSuccessScreen() {
     };
 
     verifyPayment();
-  }, [session_id]);
+  }, [checkSubscription, session_id, setSubscribed]);
 
   return (
     <SafeAreaView style={styles.container}>
