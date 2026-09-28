@@ -1,5 +1,6 @@
-import React, { useState, useEffect, createContext, useContext } from 'react';
+import React, { useState, useEffect, useCallback, useRef, createContext, useContext } from 'react';
 import { Stack } from 'expo-router';
+import { InteractionManager } from 'react-native';
 import {
   fetchJsonWithBackend,
   getDeviceId,
@@ -39,10 +40,15 @@ export default function RootLayout() {
   const [isTrial, setIsTrial] = useState(false);
   const [trialInfo, setTrialInfo] = useState<TrialInfo | null>(null);
   const [statusMessage, setStatusMessage] = useState('');
+  const isMountedRef = useRef(true);
 
-  const checkSubscription = async () => {
+  const checkSubscription = useCallback(async () => {
     try {
       const id = await getDeviceId();
+      if (!isMountedRef.current) {
+        return;
+      }
+
       setDeviceId(id);
       
       if (!isBackendConfigured) {
@@ -70,6 +76,11 @@ export default function RootLayout() {
         trial_info?: TrialInfo | null;
         status_message?: string;
       }>(`/api/subscription/status/${id}`);
+
+      if (!isMountedRef.current) {
+        return;
+      }
+
       setIsSubscribed(Boolean(data.is_active));
       setIsTrial(Boolean(data.is_trial));
       setTrialInfo(data.trial_info ?? null);
@@ -77,26 +88,34 @@ export default function RootLayout() {
       setIsLoading(false);
     } catch (error) {
       console.error('Error checking subscription:', error);
+      if (!isMountedRef.current) {
+        return;
+      }
+
       setIsSubscribed(true);
       setIsTrial(false);
       setTrialInfo(null);
       setStatusMessage('Offline mode enabled');
       setIsLoading(false);
     }
-  };
-
-  useEffect(() => {
-    // Initialize device ID immediately without blocking app startup
-    getDeviceId().then(id => setDeviceId(id)).catch(console.error);
-    
-    // Run subscription check in background (non-blocking)
-    checkSubscription().catch(console.error);
   }, []);
 
-  const setSubscribed = (value: boolean) => {
+  useEffect(() => {
+    isMountedRef.current = true;
+    const task = InteractionManager.runAfterInteractions(() => {
+      void checkSubscription();
+    });
+
+    return () => {
+      task.cancel();
+      isMountedRef.current = false;
+    };
+  }, [checkSubscription]);
+
+  const setSubscribed = useCallback((value: boolean) => {
     setIsSubscribed(value);
     setIsTrial(false);
-  };
+  }, []);
 
   return (
     <SubscriptionContext.Provider value={{ 

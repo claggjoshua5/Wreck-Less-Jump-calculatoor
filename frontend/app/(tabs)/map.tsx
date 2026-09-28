@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Text,
   View,
@@ -9,6 +9,7 @@ import {
   ScrollView,
   RefreshControl,
   Modal,
+  InteractionManager,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
@@ -33,8 +34,9 @@ export default function MapScreen() {
   const [selectedLocation, setSelectedLocation] = useState<MapLocation | null>(null);
   const [mapCenter, setMapCenter] = useState<{ lat: number; lng: number }>({ lat: 39.8283, lng: -98.5795 }); // US center
   const [mapZoom, setMapZoom] = useState(4);
+  const isMountedRef = useRef(true);
 
-  const fetchLocations = async () => {
+  const fetchLocations = useCallback(async () => {
     try {
       let data: MapLocation[];
       const deviceId = await getDeviceId();
@@ -51,6 +53,10 @@ export default function MapScreen() {
         data = await listMapLocationsLocally();
       }
 
+      if (!isMountedRef.current) {
+        return;
+      }
+
       setLocations(data);
       
       // Center map on locations if available
@@ -62,16 +68,22 @@ export default function MapScreen() {
     } catch (error) {
       console.error('Error fetching locations:', error);
     } finally {
-      setIsLoading(false);
-      setRefreshing(false);
+      if (isMountedRef.current) {
+        setIsLoading(false);
+        setRefreshing(false);
+      }
     }
-  };
+  }, []);
 
-  const getUserLocation = async () => {
+  const getUserLocation = useCallback(async () => {
     const { status } = await Location.requestForegroundPermissionsAsync();
     if (status === 'granted') {
       try {
         const location = await Location.getCurrentPositionAsync({});
+        if (!isMountedRef.current) {
+          return;
+        }
+
         setUserLocation({
           latitude: location.coords.latitude,
           longitude: location.coords.longitude,
@@ -85,17 +97,25 @@ export default function MapScreen() {
         console.log('Error getting location:', error);
       }
     }
-  };
+  }, []);
 
   useEffect(() => {
-    getUserLocation();
-    fetchLocations();
-  }, []);
+    isMountedRef.current = true;
+    const task = InteractionManager.runAfterInteractions(() => {
+      void getUserLocation();
+      void fetchLocations();
+    });
+
+    return () => {
+      task.cancel();
+      isMountedRef.current = false;
+    };
+  }, [fetchLocations, getUserLocation]);
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
-    fetchLocations();
-  }, []);
+    void fetchLocations();
+  }, [fetchLocations]);
 
   const formatDate = (dateString: string) => {
     const date = new Date(dateString);

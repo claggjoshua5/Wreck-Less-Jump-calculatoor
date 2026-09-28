@@ -7,11 +7,6 @@
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "userInterfaceStyle": "dark",
-    "splash": {
-      "image": "./assets/images/splash-image.png",
-      "resizeMode": "contain",
-      "backgroundColor": "#121212"
-    },
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.joshandheather.wrecklessjumpcalculator"
@@ -29,7 +24,14 @@
       ]
     },
     "plugins": [
-      ["./plugins/withAbiFilters", { "abiFilters": ["arm64-v8a"] }],
+      [
+        "./plugins/withAbiFilters",
+        {
+          "abiFilters": [
+            "arm64-v8a"
+          ]
+        }
+      ],
       "expo-router",
       [
         "expo-location",
@@ -43,10 +45,13 @@
           "image": "./assets/images/splash-image.png",
           "imageWidth": 200,
           "resizeMode": "contain",
-          "backgroundColor": "#000"
+          "backgroundColor": "#121212"
         }
       ],
-      "expo-web-browser"
+      "expo-web-browser",
+      "expo-font",
+      "expo-image",
+      "expo-status-bar"
     ]
   }
 }

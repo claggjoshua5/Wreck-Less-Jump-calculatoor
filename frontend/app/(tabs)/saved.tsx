@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Text,
   View,
@@ -12,6 +12,7 @@ import {
   Share,
   TextInput,
   Modal,
+  InteractionManager,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
@@ -36,8 +37,9 @@ export default function SavedScreen() {
   const [isLookingUp, setIsLookingUp] = useState(false);
   const [showLookupModal, setShowLookupModal] = useState(false);
   const [selectedCalc, setSelectedCalc] = useState<SavedCalculation | null>(null);
+  const isMountedRef = useRef(true);
 
-  const fetchCalculations = async () => {
+  const fetchCalculations = useCallback(async () => {
     try {
       let data: SavedCalculation[];
       const deviceId = await getDeviceId();
@@ -54,23 +56,37 @@ export default function SavedScreen() {
         data = await listSavedCalculationsLocally();
       }
 
+      if (!isMountedRef.current) {
+        return;
+      }
+
       setCalculations(data);
     } catch (error) {
       console.error('Error fetching calculations:', error);
     } finally {
-      setIsLoading(false);
-      setRefreshing(false);
+      if (isMountedRef.current) {
+        setIsLoading(false);
+        setRefreshing(false);
+      }
     }
-  };
+  }, []);
 
   useEffect(() => {
-    fetchCalculations();
-  }, []);
+    isMountedRef.current = true;
+    const task = InteractionManager.runAfterInteractions(() => {
+      void fetchCalculations();
+    });
+
+    return () => {
+      task.cancel();
+      isMountedRef.current = false;
+    };
+  }, [fetchCalculations]);
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
-    fetchCalculations();
-  }, []);
+    void fetchCalculations();
+  }, [fetchCalculations]);
 
   const handleDelete = async (id: string, name: string) => {
     Alert.alert(
