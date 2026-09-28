@@ -1,9 +1,10 @@
 import React, { useState, useEffect, createContext, useContext } from 'react';
 import { Stack } from 'expo-router';
-import { Platform } from 'react-native';
 import {
   fetchJsonWithBackend,
+  getDeviceId,
   isBackendConfigured,
+  isPaywallEnabled,
   TrialInfo,
 } from '@/lib/appSupport';
 
@@ -31,49 +32,9 @@ export const SubscriptionContext = createContext<SubscriptionContextType>({
 
 export const useSubscription = () => useContext(SubscriptionContext);
 
-// Platform-agnostic storage
-const storage = {
-  getItem: async (key: string): Promise<string | null> => {
-    if (Platform.OS === 'web') {
-      return localStorage.getItem(key);
-    } else {
-      // For native, use a simple in-memory fallback with persistence attempt
-      try {
-        const AsyncStorage = require('@react-native-async-storage/async-storage').default;
-        return await AsyncStorage.getItem(key);
-      } catch {
-        return null;
-      }
-    }
-  },
-  setItem: async (key: string, value: string): Promise<void> => {
-    if (Platform.OS === 'web') {
-      localStorage.setItem(key, value);
-    } else {
-      try {
-        const AsyncStorage = require('@react-native-async-storage/async-storage').default;
-        await AsyncStorage.setItem(key, value);
-      } catch {
-        // Silently fail on native if storage not available
-      }
-    }
-  },
-};
-
-// Generate or retrieve device ID
-const getDeviceId = async (): Promise<string> => {
-  let deviceId = await storage.getItem('device_id');
-  if (!deviceId) {
-    // Generate a unique device ID
-    deviceId = `device_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
-    await storage.setItem('device_id', deviceId);
-  }
-  return deviceId;
-};
-
 export default function RootLayout() {
-  const [isSubscribed, setIsSubscribed] = useState(true);
-  const [isLoading, setIsLoading] = useState(false);
+  const [isSubscribed, setIsSubscribed] = useState(!isPaywallEnabled);
+  const [isLoading, setIsLoading] = useState(isPaywallEnabled);
   const [deviceId, setDeviceId] = useState('');
   const [isTrial, setIsTrial] = useState(false);
   const [trialInfo, setTrialInfo] = useState<TrialInfo | null>(null);
@@ -89,9 +50,20 @@ export default function RootLayout() {
         setIsTrial(false);
         setTrialInfo(null);
         setStatusMessage('Offline mode enabled');
+        setIsLoading(false);
         return;
       }
 
+      if (!isPaywallEnabled) {
+        setIsSubscribed(true);
+        setIsTrial(false);
+        setTrialInfo(null);
+        setStatusMessage('Backend connected; subscriptions disabled');
+        setIsLoading(false);
+        return;
+      }
+
+      setIsLoading(true);
       const data = await fetchJsonWithBackend<{
         is_active: boolean;
         is_trial?: boolean;
@@ -102,12 +74,14 @@ export default function RootLayout() {
       setIsTrial(Boolean(data.is_trial));
       setTrialInfo(data.trial_info ?? null);
       setStatusMessage(data.status_message ?? '');
+      setIsLoading(false);
     } catch (error) {
       console.error('Error checking subscription:', error);
       setIsSubscribed(true);
       setIsTrial(false);
       setTrialInfo(null);
       setStatusMessage('Offline mode enabled');
+      setIsLoading(false);
     }
   };
 

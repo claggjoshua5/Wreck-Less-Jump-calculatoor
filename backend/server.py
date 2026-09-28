@@ -54,7 +54,9 @@ class LocationData(BaseModel):
 
 # Payment Models
 class CreateCheckoutRequest(BaseModel):
-    origin_url: str
+    origin_url: Optional[str] = None
+    success_url: Optional[str] = None
+    cancel_url: Optional[str] = None
     device_id: str
 
 
@@ -143,6 +145,7 @@ class JumpCalculationResult(BaseModel):
 
 class SavedCalculation(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    device_id: Optional[str] = None
     name: str
     description: Optional[str] = None
     calculation: JumpCalculationResult
@@ -153,6 +156,7 @@ class SavedCalculation(BaseModel):
 
 
 class SaveCalculationRequest(BaseModel):
+    device_id: str
     name: str
     description: Optional[str] = None
     calculation: JumpCalculationResult
@@ -251,18 +255,46 @@ def generate_share_code() -> str:
     return uuid.uuid4().hex[:8].upper()
 
 
+def get_payment_webhook_base_url(http_request: Request) -> str:
+    configured_base = os.environ.get("PUBLIC_BACKEND_URL", "").strip().rstrip("/")
+    if configured_base:
+        return configured_base
+    return str(http_request.base_url).rstrip("/")
+
+
+def require_device_id(device_id: Optional[str]) -> str:
+    normalized_device_id = (device_id or "").strip()
+    if not normalized_device_id:
+        raise HTTPException(status_code=400, detail="device_id is required")
+    return normalized_device_id
+
+
+def calculate_safety_margin(total_weight_lbs: float, ramp_height_ft: float, ramp_angle_deg: float) -> float:
+    weight_margin = max(0, (total_weight_lbs - 350) / 1500)
+    short_ramp_margin = max(0, (4 - ramp_height_ft) * 0.01) if ramp_height_ft > 0 else 0.04
+    steep_ramp_margin = min((ramp_angle_deg - 35) / 300, 0.08) if ramp_angle_deg > 35 else 0
+    return min(0.35, 0.15 + weight_margin + short_ramp_margin + steep_ramp_margin)
+
+
 # ==================== PAYMENT ENDPOINTS ====================
 
 @api_router.post("/payments/create-checkout", response_model=CheckoutResponse)
 async def create_checkout_session(request: CreateCheckoutRequest, http_request: Request):
-    """Create a Stripe checkout session for monthly subscription (no trial)."""
+    """Create a Stripe checkout session for a 30-day access pass."""
     try:
-        host_url = request.origin_url.rstrip('/')
-        webhook_url = f"{host_url}/api/webhook/stripe"
+        if not STRIPE_API_KEY:
+            raise HTTPException(status_code=503, detail="Payments are not configured")
+
+        webhook_base_url = get_payment_webhook_base_url(http_request)
+        webhook_url = f"{webhook_base_url}/api/webhook/stripe"
         stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
-        
-        success_url = f"{host_url}/payment-success?session_id={{CHECKOUT_SESSION_ID}}"
-        cancel_url = f"{host_url}/payment-cancel"
+
+        host_url = (request.origin_url or "").rstrip("/")
+        success_url = request.success_url or (f"{host_url}/payment-success?session_id={{CHECKOUT_SESSION_ID}}" if host_url else None)
+        cancel_url = request.cancel_url or (f"{host_url}/payment-cancel" if host_url else None)
+
+        if not success_url or not cancel_url:
+            raise HTTPException(status_code=400, detail="Valid payment return URLs are required")
         
         checkout_request = CheckoutSessionRequest(
             amount=SUBSCRIPTION_PRICE,
@@ -271,7 +303,7 @@ async def create_checkout_session(request: CreateCheckoutRequest, http_request: 
             cancel_url=cancel_url,
             metadata={
                 "device_id": request.device_id,
-                "subscription_type": "monthly",
+                "subscription_type": "thirty_day_access",
                 "product": "dirt_bike_jump_calculator",
                 "has_trial": "false"
             }
@@ -293,6 +325,8 @@ async def create_checkout_session(request: CreateCheckoutRequest, http_request: 
             checkout_url=session.url,
             session_id=session.session_id
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Error creating checkout session: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to create checkout: {str(e)}")
@@ -355,8 +389,10 @@ async def start_free_trial(request: StartTrialRequest):
 async def get_payment_status(session_id: str, http_request: Request):
     """Check the status of a payment session."""
     try:
-        origin = str(http_request.base_url).rstrip('/')
-        webhook_url = f"{origin}/api/webhook/stripe"
+        if not STRIPE_API_KEY:
+            raise HTTPException(status_code=503, detail="Payments are not configured")
+
+        webhook_url = f"{get_payment_webhook_base_url(http_request)}/api/webhook/stripe"
         stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
         
         checkout_status = await stripe_checkout.get_checkout_status(session_id)
@@ -379,7 +415,7 @@ async def get_payment_status(session_id: str, http_request: Request):
                     trial_ends_at = now + timedelta(days=3)
                     subscription_expires_at = now + timedelta(days=33)  # 3 day trial + 30 day subscription
                 else:
-                    # Direct subscription: 30 days
+                    # Direct purchase: 30 days of access
                     trial_ends_at = None
                     subscription_expires_at = now + timedelta(days=30)
                 
@@ -477,7 +513,7 @@ async def get_subscription_status(device_id: str):
                         expires_at=expires_at,
                         device_id=device_id,
                         is_trial=False,
-                        status_message="Premium subscriber"
+                        status_message="30-day access active"
                     )
             
             return SubscriptionStatus(
@@ -485,16 +521,16 @@ async def get_subscription_status(device_id: str):
                 expires_at=expires_at,
                 device_id=device_id,
                 is_trial=False,
-                status_message="Premium subscriber"
+                status_message="30-day access active"
             )
     
-    # No subscription - user needs to start trial with credit card
+    # No active access
     return SubscriptionStatus(
         is_active=False,
         device_id=device_id,
         is_trial=False,
         trial_info=None,
-        status_message="Start your 3-day free trial"
+        status_message="Start your 3-day trial or unlock 30-day access"
     )
 
 
@@ -502,11 +538,14 @@ async def get_subscription_status(device_id: str):
 async def stripe_webhook(request: Request):
     """Handle Stripe webhook events."""
     try:
+        if not STRIPE_API_KEY:
+            raise HTTPException(status_code=503, detail="Payments are not configured")
+
         body = await request.body()
         signature = request.headers.get("Stripe-Signature")
         
         # Initialize Stripe
-        host_url = str(request.base_url).rstrip('/')
+        host_url = get_payment_webhook_base_url(request)
         webhook_url = f"{host_url}/api/webhook/stripe"
         stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
         
@@ -548,9 +587,11 @@ async def stripe_webhook(request: Request):
                     )
         
         return {"status": "ok"}
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Webhook error: {str(e)}")
-        return {"status": "error", "message": str(e)}
+        raise HTTPException(status_code=500, detail=f"Webhook error: {str(e)}")
 
 
 # ==================== CALCULATOR ENDPOINTS ====================
@@ -680,10 +721,12 @@ async def calculate_jump(input_data: JumpCalculationInput):
     
     gap_distance_ft = input_data.gap_distance
     landing_height_ft = input_data.landing_height or 0
+    ramp_height_ft = input_data.ramp_height or 0
     
     if input_data.unit_system == "metric":
         gap_distance_ft = input_data.gap_distance * 3.28084
         landing_height_ft = (input_data.landing_height or 0) * 3.28084
+        ramp_height_ft = (input_data.ramp_height or 0) * 3.28084
     
     try:
         result = calculate_jump_speed(
@@ -694,9 +737,9 @@ async def calculate_jump(input_data: JumpCalculationInput):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     
-    safety_factor = 1.15
-    safety_speed_mph = round(result["required_speed_mph"] * safety_factor, 2)
-    safety_speed_kph = round(result["required_speed_kph"] * safety_factor, 2)
+    safety_margin = calculate_safety_margin(total_weight_lbs, ramp_height_ft, input_data.ramp_angle)
+    safety_speed_mph = round(result["required_speed_mph"] * (1 + safety_margin), 2)
+    safety_speed_kph = round(result["required_speed_kph"] * (1 + safety_margin), 2)
     
     if result["required_speed_mph"] > 60:
         warnings.append("High speed required! This is an advanced jump. Ensure proper safety gear and experience.")
@@ -709,6 +752,9 @@ async def calculate_jump(input_data: JumpCalculationInput):
     
     if result["landing_velocity_mph"] > 50:
         warnings.append("High landing velocity. Ensure proper landing ramp and suspension setup.")
+
+    if ramp_height_ft > 0 and ramp_height_ft < 3:
+        warnings.append("Short takeoff ramp height reduces margin for body position and throttle correction.")
     
     calculation_result = JumpCalculationResult(
         input_data=input_data,
@@ -736,9 +782,11 @@ async def calculate_jump(input_data: JumpCalculationInput):
 @api_router.post("/save-calculation", response_model=SavedCalculation)
 async def save_calculation(request: SaveCalculationRequest):
     """Save a calculation with optional location and sharing."""
+    device_id = require_device_id(request.device_id)
     share_code = generate_share_code() if request.share else None
     
     saved_calc = SavedCalculation(
+        device_id=device_id,
         name=request.name,
         description=request.description,
         calculation=request.calculation,
@@ -753,34 +801,40 @@ async def save_calculation(request: SaveCalculationRequest):
 
 
 @api_router.get("/saved-calculations", response_model=List[SavedCalculation])
-async def get_saved_calculations(limit: int = 50):
+async def get_saved_calculations(device_id: str, limit: int = 50):
     """Get all saved calculations."""
-    calculations = await db.saved_calculations.find().sort("created_at", -1).limit(limit).to_list(limit)
+    normalized_device_id = require_device_id(device_id)
+    calculations = await db.saved_calculations.find(
+        {"device_id": normalized_device_id}
+    ).sort("created_at", -1).limit(limit).to_list(limit)
     return [SavedCalculation(**calc) for calc in calculations]
 
 
 @api_router.get("/saved-calculation/{calculation_id}", response_model=SavedCalculation)
-async def get_saved_calculation(calculation_id: str):
+async def get_saved_calculation(calculation_id: str, device_id: str):
     """Get a specific saved calculation by ID."""
-    calc = await db.saved_calculations.find_one({"id": calculation_id})
+    normalized_device_id = require_device_id(device_id)
+    calc = await db.saved_calculations.find_one({"id": calculation_id, "device_id": normalized_device_id})
     if not calc:
         raise HTTPException(status_code=404, detail="Calculation not found")
     return SavedCalculation(**calc)
 
 
 @api_router.delete("/saved-calculation/{calculation_id}")
-async def delete_saved_calculation(calculation_id: str):
+async def delete_saved_calculation(calculation_id: str, device_id: str):
     """Delete a saved calculation."""
-    result = await db.saved_calculations.delete_one({"id": calculation_id})
+    normalized_device_id = require_device_id(device_id)
+    result = await db.saved_calculations.delete_one({"id": calculation_id, "device_id": normalized_device_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Calculation not found")
     return {"message": "Calculation deleted"}
 
 
 @api_router.post("/share-calculation/{calculation_id}")
-async def share_calculation(calculation_id: str):
+async def share_calculation(calculation_id: str, device_id: str):
     """Make a calculation shareable and get share code."""
-    calc = await db.saved_calculations.find_one({"id": calculation_id})
+    normalized_device_id = require_device_id(device_id)
+    calc = await db.saved_calculations.find_one({"id": calculation_id, "device_id": normalized_device_id})
     if not calc:
         raise HTTPException(status_code=404, detail="Calculation not found")
     
@@ -806,10 +860,11 @@ async def get_shared_calculation(share_code: str):
 
 
 @api_router.get("/map-locations")
-async def get_map_locations():
+async def get_map_locations(device_id: str):
     """Get all calculations with locations for map display."""
+    normalized_device_id = require_device_id(device_id)
     calculations = await db.saved_calculations.find(
-        {"location": {"$ne": None}}
+        {"device_id": normalized_device_id, "location": {"$ne": None}}
     ).to_list(1000)
     
     locations = []

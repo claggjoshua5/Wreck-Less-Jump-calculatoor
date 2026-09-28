@@ -19,11 +19,11 @@ import { Ionicons } from '@expo/vector-icons';
 import {
   deleteCalculationLocally,
   fetchJsonWithBackend,
+  getDeviceId,
   isBackendConfigured,
   listSavedCalculationsLocally,
   lookupSharedCalculationLocally,
   SavedCalculation,
-  shareCalculationLocally,
 } from '@/lib/appSupport';
 
 const { width } = Dimensions.get('window');
@@ -40,10 +40,13 @@ export default function SavedScreen() {
   const fetchCalculations = async () => {
     try {
       let data: SavedCalculation[];
+      const deviceId = await getDeviceId();
 
       if (isBackendConfigured) {
         try {
-          data = await fetchJsonWithBackend<SavedCalculation[]>('/api/saved-calculations');
+          data = await fetchJsonWithBackend<SavedCalculation[]>(
+            `/api/saved-calculations?device_id=${encodeURIComponent(deviceId)}`
+          );
         } catch {
           data = await listSavedCalculationsLocally();
         }
@@ -80,11 +83,15 @@ export default function SavedScreen() {
           style: 'destructive',
           onPress: async () => {
             try {
+              const deviceId = await getDeviceId();
               if (isBackendConfigured) {
                 try {
-                  await fetchJsonWithBackend(`/api/saved-calculation/${id}`, {
+                  await fetchJsonWithBackend(
+                    `/api/saved-calculation/${id}?device_id=${encodeURIComponent(deviceId)}`,
+                    {
                     method: 'DELETE',
-                  });
+                    }
+                  );
                 } catch {
                   await deleteCalculationLocally(id);
                 }
@@ -102,31 +109,29 @@ export default function SavedScreen() {
   };
 
   const handleShare = async (calc: SavedCalculation) => {
+    if (!isBackendConfigured) {
+      await shareCalculationDetails(calc);
+      return;
+    }
+
     if (calc.share_code) {
       // Already shared, just share the code
       await shareCode(calc);
     } else {
       // Generate share code first
       try {
-        const sharedCalculation = isBackendConfigured
-          ? await (async () => {
-              try {
-                const data = await fetchJsonWithBackend<{ share_code: string }>(
-                  `/api/share-calculation/${calc.id}`,
-                  {
-                    method: 'POST',
-                  }
-                );
-                return {
-                  ...calc,
-                  share_code: data.share_code,
-                  is_shared: true,
-                };
-              } catch {
-                return shareCalculationLocally(calc.id);
-              }
-            })()
-          : await shareCalculationLocally(calc.id);
+        const deviceId = await getDeviceId();
+        const data = await fetchJsonWithBackend<{ share_code: string }>(
+          `/api/share-calculation/${calc.id}?device_id=${encodeURIComponent(deviceId)}`,
+          {
+            method: 'POST',
+          }
+        );
+        const sharedCalculation = {
+          ...calc,
+          share_code: data.share_code,
+          is_shared: true,
+        };
 
         calc.share_code = sharedCalculation.share_code;
         calc.is_shared = true;
@@ -135,6 +140,17 @@ export default function SavedScreen() {
       } catch {
         Alert.alert('Error', 'Failed to generate share code');
       }
+    }
+  };
+
+  const shareCalculationDetails = async (calc: SavedCalculation) => {
+    const isMetric = calc.calculation.input_data.unit_system === 'metric';
+    try {
+      await Share.share({
+        message: `Dirt bike jump: "${calc.name}"\n\nRequired Speed: ${isMetric ? calc.calculation.required_speed_kph : calc.calculation.required_speed_mph} ${isMetric ? 'km/h' : 'mph'}\nSafe Speed: ${isMetric ? calc.calculation.safety_speed_kph : calc.calculation.safety_speed_mph} ${isMetric ? 'km/h' : 'mph'}\nGap: ${calc.calculation.input_data.gap_distance} ${isMetric ? 'm' : 'ft'}\nRamp Height: ${calc.calculation.input_data.ramp_height} ${isMetric ? 'm' : 'ft'}\nLanding Height Diff: ${calc.calculation.input_data.landing_height} ${isMetric ? 'm' : 'ft'}\nAngle: ${calc.calculation.input_data.ramp_angle}°\n${calc.location?.address ? `Location: ${calc.location.address}` : ''}`,
+      });
+    } catch (error) {
+      console.log('Error sharing:', error);
     }
   };
 

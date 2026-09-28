@@ -1,5 +1,4 @@
 package com.joshandheather.wrecklessjumpcalculator
-import com.viromedia.bridge.ReactViroPackage
 
 import android.app.Application
 import android.content.res.Configuration
@@ -26,9 +25,6 @@ class MainApplication : Application(), ReactApplication {
             PackageList(this).packages.apply {
               // Packages that cannot be autolinked yet can be added manually here, for example:
               // add(MyReactNativePackage())
-            add(ReactViroPackage(ReactViroPackage.ViroPlatform.AR))
-            add(ReactViroPackage(ReactViroPackage.ViroPlatform.GVR))
-
             }
 
           override fun getJSMainModuleName(): String = ".expo/.virtual-metro-entry"

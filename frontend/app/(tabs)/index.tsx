@@ -24,9 +24,11 @@ import {
   calculateJumpLocally,
   CalculationResult,
   fetchJsonWithBackend,
+  getDeviceId,
   isBackendConfigured,
   JumpCalculationInput,
   LocationData,
+  SavedCalculation,
   saveCalculationLocally,
 } from '@/lib/appSupport';
 
@@ -199,11 +201,17 @@ export default function Index() {
 
     setIsSaving(true);
     try {
+      if (shareCalculation && !isBackendConfigured) {
+        throw new Error('Share codes require the backend so other riders can look them up.');
+      }
+
+      const deviceId = await getDeviceId();
       const locationToSave =
         includeLocation && !currentLocation
           ? await loadCurrentLocation()
           : currentLocation;
       const payload = {
+        device_id: deviceId,
         name: saveName,
         description: saveDescription,
         calculation: result,
@@ -211,11 +219,12 @@ export default function Index() {
         share: shareCalculation,
       };
 
-      let savedData: { share_code?: string };
+      let savedData: SavedCalculation;
+      let savedLocallyWithoutShare = false;
 
       if (isBackendConfigured) {
         try {
-          savedData = await fetchJsonWithBackend<{ share_code?: string }>(
+          savedData = await fetchJsonWithBackend<SavedCalculation>(
             '/api/save-calculation',
             {
               method: 'POST',
@@ -226,7 +235,11 @@ export default function Index() {
             }
           );
         } catch {
-          savedData = await saveCalculationLocally(payload);
+          savedData = await saveCalculationLocally({
+            ...payload,
+            share: shareCalculation ? false : payload.share,
+          });
+          savedLocallyWithoutShare = shareCalculation;
         }
       } else {
         savedData = await saveCalculationLocally(payload);
@@ -246,6 +259,11 @@ export default function Index() {
             { text: 'Copy Code', onPress: () => handleShareCode(shareCode) },
             { text: 'OK' },
           ]
+        );
+      } else if (savedLocallyWithoutShare) {
+        Alert.alert(
+          'Saved Locally',
+          'The calculation was saved on this device, but a share code could not be created because the backend was unavailable.'
         );
       } else {
         Alert.alert('Saved!', 'Your calculation has been saved successfully.');
@@ -301,6 +319,18 @@ export default function Index() {
     }
   };
 
+  const toggleShareCalculation = () => {
+    if (!isBackendConfigured) {
+      Alert.alert(
+        'Backend Required',
+        'Share codes are only available when the backend is configured, because other riders need a shared lookup service.'
+      );
+      return;
+    }
+
+    setShareCalculation(!shareCalculation);
+  };
+
   const distanceUnit = useMetric ? 'm' : 'ft';
   const weightUnit = useMetric ? 'kg' : 'lbs';
   const speedUnit = useMetric ? 'km/h' : 'mph';
@@ -332,6 +362,10 @@ export default function Index() {
     // Current bike position based on animation
     const currentIndex = Math.floor(animationProgress * (points.length - 1));
     const currentPoint = points[currentIndex] || points[0];
+    const landingHeightFeet =
+      result.input_data.unit_system === 'metric'
+        ? (result.input_data.landing_height || 0) * 3.28084
+        : result.input_data.landing_height || 0;
     
     // Ramp visualization
     const rampLength = maxX * 0.15;
@@ -379,9 +413,9 @@ export default function Index() {
           {/* Landing zone */}
           <Line
             x1={transformX(maxX * 0.85)}
-            y1={transformY(result.input_data.landing_height || 0)}
+            y1={transformY(landingHeightFeet)}
             x2={svgWidth - padding}
-            y2={transformY(result.input_data.landing_height || 0)}
+            y2={transformY(landingHeightFeet)}
             stroke="#4CAF50"
             strokeWidth="3"
           />
@@ -795,7 +829,7 @@ export default function Index() {
 
               <TouchableOpacity
                 style={styles.optionRow}
-                onPress={() => setShareCalculation(!shareCalculation)}
+                onPress={toggleShareCalculation}
               >
                 <Ionicons
                   name={shareCalculation ? 'checkbox' : 'square-outline'}
@@ -804,7 +838,9 @@ export default function Index() {
                 />
                 <View style={styles.optionContent}>
                   <Text style={styles.optionTitle}>Share with Others</Text>
-                  <Text style={styles.optionSubtitle}>Generate a share code</Text>
+                  <Text style={styles.optionSubtitle}>
+                    {isBackendConfigured ? 'Generate a share code' : 'Requires backend connection'}
+                  </Text>
                 </View>
               </TouchableOpacity>
 

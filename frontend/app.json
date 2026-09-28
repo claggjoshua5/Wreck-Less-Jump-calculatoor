@@ -3,24 +3,25 @@
     "name": "Wreck-Less",
     "slug": "Wreck-Less-Jump-calculatoor",
     "version": "1.0.0",
+    "scheme": "wreckless",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
+    "icon": "./assets/images/icon.png",
     "userInterfaceStyle": "dark",
     "splash": {
-      "image": "./assets/splash.png",
+      "image": "./assets/images/splash-image.png",
       "resizeMode": "contain",
       "backgroundColor": "#121212"
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.claggjoshua.wreckless"
+      "bundleIdentifier": "com.joshandheather.wrecklessjumpcalculator"
     },
     "android": {
       "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
+        "foregroundImage": "./assets/images/adaptive-icon.png",
         "backgroundColor": "#121212"
       },
-      "package": "com.claggjoshua.wreckless",
+      "package": "com.joshandheather.wrecklessjumpcalculator",
       "permissions": [
         "ACCESS_FINE_LOCATION",
         "ACCESS_COARSE_LOCATION",
@@ -48,14 +49,7 @@
           "backgroundColor": "#000"
         }
       ],
-      "expo-web-browser",
-      "@reactvision/react-viro"
-      ]
-    ],
-    "extra": {
-      "eas": {
-        "projectId": "your-project-id"
-      }
-    }
+      "expo-web-browser"
+    ]
   }
 }

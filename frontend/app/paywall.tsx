@@ -16,11 +16,10 @@ import { useRouter } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
 import * as Linking from 'expo-linking';
 import { useSubscription } from './_layout';
-
-const EXPO_PUBLIC_BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL;
+import { BACKEND_URL, isPaywallEnabled } from '@/lib/appSupport';
 
 export default function PaywallScreen() {
-  const { deviceId, checkSubscription, trialInfo } = useSubscription();
+  const { deviceId, checkSubscription } = useSubscription();
   const router = useRouter();
   const [isLoading, setIsLoading] = useState(false);
   const [isTrialLoading, setIsTrialLoading] = useState(false);
@@ -31,8 +30,13 @@ export default function PaywallScreen() {
     setError('');
 
     try {
+      if (!isPaywallEnabled || !BACKEND_URL) {
+        router.replace('/(tabs)');
+        return;
+      }
+
       // Start free trial — no credit card or Stripe checkout needed
-      const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/payments/start-trial`, {
+      const response = await fetch(`${BACKEND_URL}/api/payments/start-trial`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -69,19 +73,28 @@ export default function PaywallScreen() {
     setError('');
 
     try {
-      // Use Expo Linking to create a runtime-correct deep link URL
-      const originUrl =
-        Platform.OS === 'web'
-          ? window.location.origin
-          : Linking.createURL('');
+      if (!isPaywallEnabled || !BACKEND_URL) {
+        router.replace('/(tabs)');
+        return;
+      }
 
-      const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/payments/create-checkout`, {
+      const successUrl =
+        Platform.OS === 'web'
+          ? `${window.location.origin}/payment-success?session_id={CHECKOUT_SESSION_ID}`
+          : `${Linking.createURL('/payment-success')}?session_id={CHECKOUT_SESSION_ID}`;
+      const cancelUrl =
+        Platform.OS === 'web'
+          ? `${window.location.origin}/payment-cancel`
+          : Linking.createURL('/payment-cancel');
+
+      const response = await fetch(`${BACKEND_URL}/api/payments/create-checkout`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          origin_url: originUrl,
+          success_url: successUrl,
+          cancel_url: cancelUrl,
           device_id: deviceId,
         }),
       });
@@ -113,7 +126,7 @@ export default function PaywallScreen() {
     { icon: 'bookmark', title: 'Save & Share', description: 'Save calculations with location' },
     { icon: 'map', title: 'Jump Map', description: 'See jump locations worldwide' },
     { icon: 'shield-checkmark', title: 'Safety Warnings', description: 'Get important safety alerts' },
-    { icon: 'sync', title: 'Monthly Updates', description: 'New features every month' },
+    { icon: 'sync', title: 'Ride Notes', description: 'Keep each jump setup organized' },
   ];
 
   return (
@@ -164,9 +177,9 @@ export default function PaywallScreen() {
         {/* Pricing Card */}
         <View style={styles.pricingCard}>
           <View style={styles.pricingHeader}>
-            <Text style={styles.pricingLabel}>THEN $2.99/MONTH</Text>
+            <Text style={styles.pricingLabel}>OR $2.99 FOR 30 DAYS</Text>
           </View>
-          <Text style={styles.pricingNote}>Subscribe when your trial ends</Text>
+            <Text style={styles.pricingNote}>Unlock full app access for the next 30 days</Text>
         </View>
 
         {/* Error Message */}
@@ -211,7 +224,7 @@ export default function PaywallScreen() {
           ) : (
             <>
               <Ionicons name="card" size={24} color="#FF6B35" />
-              <Text style={styles.subscribeButtonText}>Subscribe Now - $2.99/month</Text>
+              <Text style={styles.subscribeButtonText}>Unlock 30-Day Access - $2.99</Text>
             </>
           )}
         </TouchableOpacity>
@@ -219,7 +232,7 @@ export default function PaywallScreen() {
         {/* Terms */}
         <Text style={styles.terms}>
           By starting a trial, you agree to our Terms of Service and Privacy Policy. 
-          After the 3-day free trial, you can subscribe for $2.99/month to keep using the app.
+          After the 3-day free trial, you can unlock 30 days of access for $2.99.
         </Text>
 
         {/* Secure Payment Badge */}
