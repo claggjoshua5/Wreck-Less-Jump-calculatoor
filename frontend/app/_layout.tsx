@@ -45,11 +45,20 @@ export default function RootLayout() {
       const id = await getDeviceId();
       setDeviceId(id);
       
-      if (!isBackendConfigured || !isPaywallEnabled) {
+      if (!isBackendConfigured) {
         setIsSubscribed(true);
         setIsTrial(false);
         setTrialInfo(null);
         setStatusMessage('Offline mode enabled');
+        setIsLoading(false);
+        return;
+      }
+
+      if (!isPaywallEnabled) {
+        setIsSubscribed(true);
+        setIsTrial(false);
+        setTrialInfo(null);
+        setStatusMessage('Backend connected; subscriptions disabled');
         setIsLoading(false);
         return;
       }

@@ -147,7 +147,7 @@ export default function SavedScreen() {
     const isMetric = calc.calculation.input_data.unit_system === 'metric';
     try {
       await Share.share({
-        message: `Dirt bike jump: "${calc.name}"\n\nRequired Speed: ${isMetric ? calc.calculation.required_speed_kph : calc.calculation.required_speed_mph} ${isMetric ? 'km/h' : 'mph'}\nSafe Speed: ${isMetric ? calc.calculation.safety_speed_kph : calc.calculation.safety_speed_mph} ${isMetric ? 'km/h' : 'mph'}\nGap: ${calc.calculation.input_data.gap_distance} ${isMetric ? 'm' : 'ft'}\nAngle: ${calc.calculation.input_data.ramp_angle}°\n${calc.location?.address ? `Location: ${calc.location.address}` : ''}`,
+        message: `Dirt bike jump: "${calc.name}"\n\nRequired Speed: ${isMetric ? calc.calculation.required_speed_kph : calc.calculation.required_speed_mph} ${isMetric ? 'km/h' : 'mph'}\nSafe Speed: ${isMetric ? calc.calculation.safety_speed_kph : calc.calculation.safety_speed_mph} ${isMetric ? 'km/h' : 'mph'}\nGap: ${calc.calculation.input_data.gap_distance} ${isMetric ? 'm' : 'ft'}\nRamp Height: ${calc.calculation.input_data.ramp_height} ${isMetric ? 'm' : 'ft'}\nLanding Height Diff: ${calc.calculation.input_data.landing_height} ${isMetric ? 'm' : 'ft'}\nAngle: ${calc.calculation.input_data.ramp_angle}°\n${calc.location?.address ? `Location: ${calc.location.address}` : ''}`,
       });
     } catch (error) {
       console.log('Error sharing:', error);
