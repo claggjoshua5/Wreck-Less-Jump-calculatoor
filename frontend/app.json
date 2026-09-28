@@ -25,7 +25,10 @@
       "permissions": [
         "ACCESS_FINE_LOCATION",
         "ACCESS_COARSE_LOCATION",
-        "WAKE_LOCK"
+        "ACCESS_BACKGROUND_LOCATION",
+        "WAKE_LOCK",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_LOCATION"
       ]
     },
     "plugins": [
@@ -34,7 +37,7 @@
       [
         "expo-location",
         {
-          "locationWhenInUsePermission": "Allow Wreck-Less to use your location while using the app."
+          "locationAlwaysAndWhenInUsePermission": "Allow Wreck-Less to track your jump speed in the background."
         }
       ],
       [
