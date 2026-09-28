@@ -17,6 +17,7 @@ import * as Location from 'expo-location';
 import Svg, { Circle, G, Text as SvgText, Rect, Line } from 'react-native-svg';
 import {
   fetchJsonWithBackend,
+  getDeviceId,
   isBackendConfigured,
   listMapLocationsLocally,
   MapLocation,
@@ -36,10 +37,13 @@ export default function MapScreen() {
   const fetchLocations = async () => {
     try {
       let data: MapLocation[];
+      const deviceId = await getDeviceId();
 
       if (isBackendConfigured) {
         try {
-          data = await fetchJsonWithBackend<MapLocation[]>('/api/map-locations');
+          data = await fetchJsonWithBackend<MapLocation[]>(
+            `/api/map-locations?device_id=${encodeURIComponent(deviceId)}`
+          );
         } catch {
           data = await listMapLocationsLocally();
         }

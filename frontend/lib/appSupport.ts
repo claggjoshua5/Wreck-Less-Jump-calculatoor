@@ -51,6 +51,7 @@ export interface LocationData {
 
 export interface SavedCalculation {
   id: string;
+  device_id?: string;
   name: string;
   description?: string;
   calculation: CalculationResult;
@@ -62,6 +63,7 @@ export interface SavedCalculation {
 
 export interface MapLocation {
   id: string;
+  device_id?: string;
   name: string;
   latitude: number;
   longitude: number;
@@ -75,11 +77,15 @@ export interface MapLocation {
 }
 
 const LOCAL_SAVED_CALCULATIONS_KEY = 'wreckless_saved_calculations_v1';
+const DEVICE_ID_STORAGE_KEY = 'device_id';
 const API_TIMEOUT_MS = 4000;
 const rawBackendUrl = process.env.EXPO_PUBLIC_BACKEND_URL?.trim() ?? '';
+const paywallFlag = process.env.EXPO_PUBLIC_ENABLE_PAYWALL?.trim().toLowerCase();
 
 export const BACKEND_URL = rawBackendUrl ? rawBackendUrl.replace(/\/+$/, '') : null;
 export const isBackendConfigured = BACKEND_URL !== null;
+export const isPaywallEnabled =
+  isBackendConfigured && (paywallFlag === 'true' || paywallFlag === '1' || paywallFlag === 'yes');
 
 const getStorage = () => {
   if (Platform.OS === 'web') {
@@ -125,6 +131,17 @@ async function getStoredJson<T>(key: string, fallback: T): Promise<T> {
 
 async function setStoredJson(key: string, value: unknown): Promise<void> {
   await storage.setItem(key, JSON.stringify(value));
+}
+
+export async function getDeviceId(): Promise<string> {
+  const existingDeviceId = await storage.getItem(DEVICE_ID_STORAGE_KEY);
+  if (existingDeviceId) {
+    return existingDeviceId;
+  }
+
+  const nextDeviceId = createId('device');
+  await storage.setItem(DEVICE_ID_STORAGE_KEY, nextDeviceId);
+  return nextDeviceId;
 }
 
 async function getSavedCalculationsStorage(): Promise<SavedCalculation[]> {
@@ -272,6 +289,17 @@ const finalizeCalculation = (
   };
 };
 
+const calculateSafetyMargin = (
+  totalWeightLbs: number,
+  rampHeightFeet: number,
+  rampAngleDegrees: number
+) => {
+  const weightMargin = Math.max(0, (totalWeightLbs - 350) / 1500);
+  const shortRampMargin = rampHeightFeet > 0 ? Math.max(0, (4 - rampHeightFeet) * 0.01) : 0.04;
+  const steepRampMargin = rampAngleDegrees > 35 ? Math.min((rampAngleDegrees - 35) / 300, 0.08) : 0;
+  return Math.min(0.35, 0.15 + weightMargin + shortRampMargin + steepRampMargin);
+};
+
 export function calculateJumpLocally(inputData: JumpCalculationInput): CalculationResult {
   if (inputData.ramp_angle <= 0 || inputData.ramp_angle >= 90) {
     throw new Error('Ramp angle must be between 0 and 90 degrees');
@@ -299,6 +327,10 @@ export function calculateJumpLocally(inputData: JumpCalculationInput): Calculati
     inputData.unit_system === 'metric'
       ? inputData.landing_height * 3.28084
       : inputData.landing_height;
+  const rampHeightFeet =
+    inputData.unit_system === 'metric'
+      ? inputData.ramp_height * 3.28084
+      : inputData.ramp_height;
 
   const calculation = calculateJumpSpeed(
     inputData.ramp_angle,
@@ -324,24 +356,33 @@ export function calculateJumpLocally(inputData: JumpCalculationInput): Calculati
     warnings.push('High landing velocity. Ensure proper landing ramp and suspension setup.');
   }
 
+  if (rampHeightFeet > 0 && rampHeightFeet < 3) {
+    warnings.push('Short takeoff ramp height reduces margin for body position and throttle correction.');
+  }
+
+  const safetyMargin = calculateSafetyMargin(totalWeightLbs, rampHeightFeet, inputData.ramp_angle);
+
   return {
     id: createId('calc'),
     input_data: inputData,
     ...calculation,
     total_weight_lbs: Number(totalWeightLbs.toFixed(2)),
     total_weight_kg: Number(totalWeightKg.toFixed(2)),
-    safety_speed_mph: Number((calculation.required_speed_mph * 1.15).toFixed(2)),
-    safety_speed_kph: Number((calculation.required_speed_kph * 1.15).toFixed(2)),
+    safety_speed_mph: Number((calculation.required_speed_mph * (1 + safetyMargin)).toFixed(2)),
+    safety_speed_kph: Number((calculation.required_speed_kph * (1 + safetyMargin)).toFixed(2)),
     warnings,
     timestamp: new Date().toISOString(),
   };
 }
 
 export async function listSavedCalculationsLocally(): Promise<SavedCalculation[]> {
-  return getSavedCalculationsStorage();
+  const calculations = await getSavedCalculationsStorage();
+  const deviceId = await getDeviceId();
+  return calculations.filter((calculation) => (calculation.device_id ?? deviceId) === deviceId);
 }
 
 export async function saveCalculationLocally(input: {
+  device_id?: string;
   name: string;
   description?: string;
   calculation: CalculationResult;
@@ -351,6 +392,7 @@ export async function saveCalculationLocally(input: {
   const calculations = await getSavedCalculationsStorage();
   const savedCalculation: SavedCalculation = {
     id: createId('saved'),
+    device_id: input.device_id ?? (await getDeviceId()),
     name: input.name,
     description: input.description,
     calculation: input.calculation,
@@ -366,13 +408,19 @@ export async function saveCalculationLocally(input: {
 
 export async function deleteCalculationLocally(id: string): Promise<void> {
   const calculations = await getSavedCalculationsStorage();
-  await setSavedCalculationsStorage(calculations.filter((calculation) => calculation.id !== id));
+  const deviceId = await getDeviceId();
+  await setSavedCalculationsStorage(
+    calculations.filter(
+      (calculation) => calculation.id !== id || (calculation.device_id ?? deviceId) !== deviceId
+    )
+  );
 }
 
 export async function shareCalculationLocally(id: string): Promise<SavedCalculation> {
   const calculations = await getSavedCalculationsStorage();
+  const deviceId = await getDeviceId();
   const updatedCalculations = calculations.map((calculation) => {
-    if (calculation.id !== id) {
+    if (calculation.id !== id || (calculation.device_id ?? deviceId) !== deviceId) {
       return calculation;
     }
 
@@ -407,11 +455,12 @@ export async function lookupSharedCalculationLocally(
 
 export async function listMapLocationsLocally(): Promise<MapLocation[]> {
   const calculations = await getSavedCalculationsStorage();
+  const deviceId = await getDeviceId();
 
   return calculations
     .filter(
       (calculation): calculation is SavedCalculation & { location: LocationData } =>
-        Boolean(calculation.location)
+        Boolean(calculation.location) && (calculation.device_id ?? deviceId) === deviceId
     )
     .map((calculation) => ({
       id: calculation.id,
