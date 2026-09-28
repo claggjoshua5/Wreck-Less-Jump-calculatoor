@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "Wreck-Less",
-    "slug": "Wreck-Less-Jump-calculatoor",
+    "slug": "wreck-less-jump-calculatoor",
     "version": "1.0.0",
     "scheme": "wreckless",
     "orientation": "portrait",
@@ -25,10 +25,7 @@
       "permissions": [
         "ACCESS_FINE_LOCATION",
         "ACCESS_COARSE_LOCATION",
-        "ACCESS_BACKGROUND_LOCATION",
-        "WAKE_LOCK",
-        "FOREGROUND_SERVICE",
-        "FOREGROUND_SERVICE_LOCATION"
+        "WAKE_LOCK"
       ]
     },
     "plugins": [
@@ -37,7 +34,7 @@
       [
         "expo-location",
         {
-          "locationAlwaysAndWhenInUsePermission": "Allow Wreck-Less to track your jump speed in the background."
+          "locationWhenInUsePermission": "Allow Wreck-Less to use your location while using the app."
         }
       ],
       [
