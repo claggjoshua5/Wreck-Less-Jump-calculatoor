@@ -78,7 +78,12 @@ export interface MapLocation {
 
 const LOCAL_SAVED_CALCULATIONS_KEY = 'wreckless_saved_calculations_v1';
 const DEVICE_ID_STORAGE_KEY = 'device_id';
-const DEVICE_TOKEN_STORAGE_KEY = 'device_token';
+// Emergency-specific identifier and secret. These are intentionally never sent or stored
+// alongside the general device_id above, and never returned by any backend endpoint, so a
+// share-code holder who learns device_id (via GET /api/shared/{share_code}) cannot use it
+// to take over a rider's emergency settings/token.
+const EMERGENCY_DEVICE_ID_STORAGE_KEY = 'emergency_device_id';
+const DEVICE_SECRET_STORAGE_KEY = 'emergency_device_secret';
 const API_TIMEOUT_MS = 4000;
 const rawBackendUrl = process.env.EXPO_PUBLIC_BACKEND_URL?.trim() ?? '';
 const paywallFlag = process.env.EXPO_PUBLIC_ENABLE_PAYWALL?.trim().toLowerCase();
@@ -116,6 +121,27 @@ const getStorage = () => {
 
 const storage = getStorage();
 
+// Secure storage for emergency credentials: SecureStore on native, localStorage on web
+// (matching the pre-existing device-token storage strategy this replaces).
+async function getSecureItem(key: string): Promise<string | null> {
+  if (Platform.OS === 'web') {
+    return typeof localStorage === 'undefined' ? null : localStorage.getItem(key);
+  }
+
+  return require('expo-secure-store').getItemAsync(key);
+}
+
+async function setSecureItem(key: string, value: string): Promise<void> {
+  if (Platform.OS === 'web') {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(key, value);
+    }
+    return;
+  }
+
+  await require('expo-secure-store').setItemAsync(key, value);
+}
+
 const createId = (prefix: string) =>
   `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
@@ -124,6 +150,39 @@ const createDeviceId = async () => {
     ? globalThis.crypto.randomUUID()
     : await require('expo-crypto').randomUUID();
   return `device_${uuid}`;
+};
+
+const createEmergencyDeviceId = async () => {
+  const uuid = globalThis.crypto?.randomUUID
+    ? globalThis.crypto.randomUUID()
+    : await require('expo-crypto').randomUUID();
+  return `emg_${uuid}`;
+};
+
+const bytesToHex = (bytes: Uint8Array): string =>
+  Array.from(bytes)
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+
+// Generates a high-entropy (32 byte / 256 bit) random secret for authenticating emergency
+// requests. The server only ever stores sha256(secret); the raw value never leaves this
+// device after generation.
+const createDeviceSecret = async (): Promise<string> => {
+  if (Platform.OS === 'web') {
+    const bytes = new Uint8Array(32);
+    if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+      crypto.getRandomValues(bytes);
+    } else {
+      for (let i = 0; i < bytes.length; i += 1) {
+        bytes[i] = Math.floor(Math.random() * 256);
+      }
+    }
+    return bytesToHex(bytes);
+  }
+
+  const Crypto = require('expo-crypto');
+  const bytes: Uint8Array = await Crypto.getRandomBytesAsync(32);
+  return bytesToHex(bytes);
 };
 
 const createShareCode = () => Math.random().toString(36).slice(2, 10).toUpperCase();
@@ -152,25 +211,49 @@ export async function getDeviceId(): Promise<string> {
   return nextDeviceId;
 }
 
-async function getDeviceToken(): Promise<string | null> {
-  if (Platform.OS === 'web') {
-    return typeof localStorage === 'undefined'
-      ? null
-      : localStorage.getItem(DEVICE_TOKEN_STORAGE_KEY);
+// The emergency_device_id is separate from the general device_id above: it is generated
+// on-device, stored in secure storage, and never returned by any backend endpoint, so it
+// can't be learned from a share code the way device_id can.
+export async function getEmergencyDeviceId(): Promise<string> {
+  const existing = await getSecureItem(EMERGENCY_DEVICE_ID_STORAGE_KEY);
+  if (existing) {
+    return existing;
   }
 
-  return require('expo-secure-store').getItemAsync(DEVICE_TOKEN_STORAGE_KEY);
+  const next = await createEmergencyDeviceId();
+  await setSecureItem(EMERGENCY_DEVICE_ID_STORAGE_KEY, next);
+  return next;
 }
 
-async function setDeviceToken(token: string): Promise<void> {
-  if (Platform.OS === 'web') {
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(DEVICE_TOKEN_STORAGE_KEY, token);
-    }
-    return;
+// Returns the client-generated secret used to authenticate emergency requests, generating
+// and persisting a new one on first use. Persistence happens BEFORE this ever needs to be
+// sent to the server, so a lost response, network timeout, or app restart can always retry
+// with the exact same secret and recover the same enrollment (see enroll_or_verify on the
+// backend). If SecureStore fails to persist the secret, this throws instead of silently
+// proceeding with an unrecoverable one-shot secret.
+export async function getDeviceSecret(): Promise<string> {
+  const existing = await getSecureItem(DEVICE_SECRET_STORAGE_KEY);
+  if (existing) {
+    return existing;
   }
 
-  await require('expo-secure-store').setItemAsync(DEVICE_TOKEN_STORAGE_KEY, token);
+  const next = await createDeviceSecret();
+  try {
+    await setSecureItem(DEVICE_SECRET_STORAGE_KEY, next);
+  } catch {
+    throw new Error(
+      'Unable to securely save your emergency device credentials. Please try again.'
+    );
+  }
+
+  const verified = await getSecureItem(DEVICE_SECRET_STORAGE_KEY);
+  if (verified !== next) {
+    throw new Error(
+      'Unable to securely save your emergency device credentials. Please try again.'
+    );
+  }
+
+  return next;
 }
 
 async function getSavedCalculationsStorage(): Promise<SavedCalculation[]> {
@@ -485,11 +568,17 @@ export async function lookupSharedCalculationLocally(
 // ==================== EMERGENCY ALERT SUPPORT ====================
 // Safety-first design: no auto-dialing and no automatic location broadcast.
 // Every action here is only ever triggered after an explicit, confirmed user tap.
+//
+// All requests here use emergency_device_id (see getEmergencyDeviceId above), a separate
+// identifier from the general device_id used for saved calculations/share codes, plus a
+// client-generated secret sent as X-Device-Token. The server never returns this secret, so
+// enrollment (the settings POST) is safe to retry: the secret is persisted locally before
+// the first request is ever sent, so a timeout, dropped response, or app restart can always
+// retry with the same secret and recover the same claim.
 
 export const EMERGENCY_ALERT_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
 
 export interface EmergencySettings {
-  device_id: string;
   allow_notifications: boolean;
   location_sharing_enabled: boolean;
   alert_cooldown_ms: number;
@@ -512,8 +601,8 @@ export interface AlertNearbyRidersResult {
 
 const EMERGENCY_SETTINGS_STORAGE_KEY = 'wreckless_emergency_settings_v1';
 const LAST_NEARBY_ALERT_STORAGE_KEY = 'wreckless_last_nearby_alert_v1';
-const emergencySettingsPath = (deviceId: string) =>
-  `/api/emergency/settings/${encodeURIComponent(deviceId)}`;
+const emergencySettingsPath = (emergencyDeviceId: string) =>
+  `/api/emergency/settings/${encodeURIComponent(emergencyDeviceId)}`;
 
 class DeviceAuthError extends Error {}
 
@@ -526,7 +615,7 @@ async function parseEmergencyResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     if (response.status === 401) {
       throw new DeviceAuthError(
-        'This device is not authorized for emergency features. Reinstall the app to create a new device identity.'
+        'This device is not authorized for emergency features.'
       );
     }
 
@@ -542,58 +631,24 @@ async function parseEmergencyResponse<T>(response: Response): Promise<T> {
     throw new Error(typeof responseBody === 'string' ? responseBody : 'Request failed');
   }
 
-  if (responseBody && typeof responseBody === 'object' && 'device_token' in responseBody) {
-    if (typeof responseBody.device_token === 'string') {
-      await setDeviceToken(responseBody.device_token);
-    }
-    delete responseBody.device_token;
-  }
-
   return responseBody as T;
 }
 
-async function fetchEmergencyJson<T>(
-  path: string,
-  deviceId: string,
-  init?: RequestInit
-): Promise<T> {
-  const makeRequest = async () => {
-    const token = await getDeviceToken();
-    return fetchWithBackend(path, {
-      ...init,
-      headers: {
-        ...(init?.headers as Record<string, string> | undefined),
-        ...(token ? { 'X-Device-Token': token } : {}),
-      },
-    });
-  };
-
-  let response = await makeRequest();
-  if (response.status !== 401) {
-    return parseEmergencyResponse<T>(response);
-  }
-
-  const token = await getDeviceToken();
-  const claimResponse = await fetchWithBackend(emergencySettingsPath(deviceId), {
-    method: 'POST',
+async function fetchEmergencyJson<T>(path: string, init?: RequestInit): Promise<T> {
+  // Persisted before every request (including enrollment), so retries always reuse the
+  // same secret instead of the server ever needing to hand back a one-time token.
+  const secret = await getDeviceSecret();
+  const response = await fetchWithBackend(path, {
+    ...init,
     headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { 'X-Device-Token': token } : {}),
+      ...(init?.headers as Record<string, string> | undefined),
+      'X-Device-Token': secret,
     },
-    body: '{}',
   });
-  const claimedSettings = await parseEmergencyResponse<EmergencySettings>(claimResponse);
-
-  if (path === emergencySettingsPath(deviceId) && (!init?.method || init.method === 'GET')) {
-    return claimedSettings as T;
-  }
-
-  response = await makeRequest();
   return parseEmergencyResponse<T>(response);
 }
 
-const defaultEmergencySettings = (deviceId: string): EmergencySettings => ({
-  device_id: deviceId,
+const defaultEmergencySettings = (): EmergencySettings => ({
   allow_notifications: true,
   location_sharing_enabled: false,
   alert_cooldown_ms: EMERGENCY_ALERT_COOLDOWN_MS,
@@ -601,10 +656,10 @@ const defaultEmergencySettings = (deviceId: string): EmergencySettings => ({
   last_known_location: null,
 });
 
-export async function getEmergencySettings(deviceId: string): Promise<EmergencySettings> {
+export async function getEmergencySettings(emergencyDeviceId: string): Promise<EmergencySettings> {
   if (isBackendConfigured) {
     try {
-      return await fetchEmergencyJson<EmergencySettings>(emergencySettingsPath(deviceId), deviceId);
+      return await fetchEmergencyJson<EmergencySettings>(emergencySettingsPath(emergencyDeviceId));
     } catch (error) {
       if (error instanceof DeviceAuthError) {
         throw error;
@@ -617,19 +672,18 @@ export async function getEmergencySettings(deviceId: string): Promise<EmergencyS
   return local
     ? {
         ...local,
-        device_id: deviceId,
         has_location: local.last_known_location != null,
       }
-    : defaultEmergencySettings(deviceId);
+    : defaultEmergencySettings();
 }
 
 export async function updateEmergencySettings(
-  deviceId: string,
+  emergencyDeviceId: string,
   update: EmergencySettingsUpdate
 ): Promise<EmergencySettings> {
   if (isBackendConfigured) {
     try {
-      return await fetchEmergencyJson<EmergencySettings>(emergencySettingsPath(deviceId), deviceId, {
+      return await fetchEmergencyJson<EmergencySettings>(emergencySettingsPath(emergencyDeviceId), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(update),
@@ -642,7 +696,7 @@ export async function updateEmergencySettings(
     }
   }
 
-  const current = await getEmergencySettings(deviceId);
+  const current = await getEmergencySettings(emergencyDeviceId);
   const next: EmergencySettings = {
     ...current,
     ...(update.allow_notifications !== undefined && { allow_notifications: update.allow_notifications }),
@@ -661,16 +715,19 @@ export async function updateEmergencySettings(
   return next;
 }
 
-export async function logCallForHelp(deviceId: string, location?: LocationData | null): Promise<void> {
+export async function logCallForHelp(
+  emergencyDeviceId: string,
+  location?: LocationData | null
+): Promise<void> {
   if (!isBackendConfigured) {
     return;
   }
 
   try {
-    await fetchEmergencyJson('/api/emergency/call-for-help', deviceId, {
+    await fetchEmergencyJson('/api/emergency/call-for-help', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ device_id: deviceId, location: location ?? null }),
+      body: JSON.stringify({ emergency_device_id: emergencyDeviceId, location: location ?? null }),
     });
   } catch (error) {
     console.log('Failed to log call-for-help attempt:', error);
@@ -681,18 +738,14 @@ export async function logCallForHelp(deviceId: string, location?: LocationData |
 }
 
 export async function sendNearbyRidersAlert(
-  deviceId: string,
+  emergencyDeviceId: string,
   location: LocationData
 ): Promise<AlertNearbyRidersResult> {
-  return fetchEmergencyJson<AlertNearbyRidersResult>(
-    '/api/emergency/alert-nearby-riders',
-    deviceId,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ device_id: deviceId, location }),
-    }
-  );
+  return fetchEmergencyJson<AlertNearbyRidersResult>('/api/emergency/alert-nearby-riders', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ emergency_device_id: emergencyDeviceId, location }),
+  });
 }
 
 export async function getLastNearbyAlertSentAt(): Promise<number | null> {
