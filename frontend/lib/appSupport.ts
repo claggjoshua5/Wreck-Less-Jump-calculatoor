@@ -453,6 +453,136 @@ export async function lookupSharedCalculationLocally(
   );
 }
 
+// ==================== EMERGENCY ALERT SUPPORT ====================
+// Safety-first design: no auto-dialing and no automatic location broadcast.
+// Every action here is only ever triggered after an explicit, confirmed user tap.
+
+export const EMERGENCY_ALERT_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+
+export interface EmergencySettings {
+  device_id: string;
+  allow_notifications: boolean;
+  location_sharing_enabled: boolean;
+  alert_cooldown_ms: number;
+  last_known_location?: LocationData | null;
+}
+
+export interface EmergencySettingsUpdate {
+  allow_notifications?: boolean;
+  location_sharing_enabled?: boolean;
+  location?: LocationData | null;
+}
+
+export interface AlertNearbyRidersResult {
+  success: boolean;
+  message: string;
+  alerted_count: number;
+  alert_id: string;
+}
+
+const EMERGENCY_SETTINGS_STORAGE_KEY = 'wreckless_emergency_settings_v1';
+const LAST_NEARBY_ALERT_STORAGE_KEY = 'wreckless_last_nearby_alert_v1';
+
+const defaultEmergencySettings = (deviceId: string): EmergencySettings => ({
+  device_id: deviceId,
+  allow_notifications: true,
+  location_sharing_enabled: false,
+  alert_cooldown_ms: EMERGENCY_ALERT_COOLDOWN_MS,
+  last_known_location: null,
+});
+
+export async function getEmergencySettings(deviceId: string): Promise<EmergencySettings> {
+  if (isBackendConfigured) {
+    try {
+      return await fetchJsonWithBackend<EmergencySettings>(`/api/emergency/settings/${deviceId}`);
+    } catch {
+      // Fall back to local storage below.
+    }
+  }
+
+  const local = await getStoredJson<EmergencySettings | null>(EMERGENCY_SETTINGS_STORAGE_KEY, null);
+  return local ? { ...local, device_id: deviceId } : defaultEmergencySettings(deviceId);
+}
+
+export async function updateEmergencySettings(
+  deviceId: string,
+  update: EmergencySettingsUpdate
+): Promise<EmergencySettings> {
+  if (isBackendConfigured) {
+    try {
+      return await fetchJsonWithBackend<EmergencySettings>(`/api/emergency/settings/${deviceId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(update),
+      });
+    } catch {
+      // Fall back to local storage below.
+    }
+  }
+
+  const current = await getEmergencySettings(deviceId);
+  const next: EmergencySettings = {
+    ...current,
+    ...(update.allow_notifications !== undefined && { allow_notifications: update.allow_notifications }),
+    ...(update.location_sharing_enabled !== undefined && {
+      location_sharing_enabled: update.location_sharing_enabled,
+      last_known_location: update.location_sharing_enabled ? current.last_known_location : null,
+    }),
+    ...(update.location !== undefined &&
+      (update.location_sharing_enabled ?? current.location_sharing_enabled) && {
+        last_known_location: update.location,
+      }),
+  };
+
+  await setStoredJson(EMERGENCY_SETTINGS_STORAGE_KEY, next);
+  return next;
+}
+
+export async function logCallForHelp(deviceId: string, location?: LocationData | null): Promise<void> {
+  if (!isBackendConfigured) {
+    return;
+  }
+
+  try {
+    await fetchJsonWithBackend('/api/emergency/call-for-help', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device_id: deviceId, location: location ?? null }),
+    });
+  } catch (error) {
+    console.log('Failed to log call-for-help attempt:', error);
+  }
+}
+
+export async function sendNearbyRidersAlert(
+  deviceId: string,
+  location: LocationData
+): Promise<AlertNearbyRidersResult> {
+  return fetchJsonWithBackend<AlertNearbyRidersResult>('/api/emergency/alert-nearby-riders', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ device_id: deviceId, location }),
+  });
+}
+
+export async function getLastNearbyAlertSentAt(): Promise<number | null> {
+  return getStoredJson<number | null>(LAST_NEARBY_ALERT_STORAGE_KEY, null);
+}
+
+export async function setLastNearbyAlertSentAt(timestamp: number): Promise<void> {
+  await setStoredJson(LAST_NEARBY_ALERT_STORAGE_KEY, timestamp);
+}
+
+export function getRemainingAlertCooldownMs(
+  lastSentAt: number | null,
+  cooldownMs: number = EMERGENCY_ALERT_COOLDOWN_MS
+): number {
+  if (!lastSentAt) {
+    return 0;
+  }
+  return Math.max(0, cooldownMs - (Date.now() - lastSentAt));
+}
+
 export async function listMapLocationsLocally(): Promise<MapLocation[]> {
   const calculations = await getSavedCalculationsStorage();
   const deviceId = await getDeviceId();
