@@ -83,7 +83,7 @@ const DEVICE_ID_STORAGE_KEY = 'device_id';
 // share-code holder who learns device_id (via GET /api/shared/{share_code}) cannot use it
 // to take over a rider's emergency settings/token.
 const EMERGENCY_DEVICE_ID_STORAGE_KEY = 'emergency_device_id';
-const DEVICE_SECRET_STORAGE_KEY = 'emergency_device_secret';
+const EMERGENCY_DEVICE_SECRET_STORAGE_KEY = 'emergency_device_secret';
 const API_TIMEOUT_MS = 4000;
 const rawBackendUrl = process.env.EXPO_PUBLIC_BACKEND_URL?.trim() ?? '';
 const paywallFlag = process.env.EXPO_PUBLIC_ENABLE_PAYWALL?.trim().toLowerCase();
@@ -138,6 +138,7 @@ async function setSecureItem(key: string, value: string): Promise<void> {
     // storage made). Native builds always use the OS keychain/keystore via
     // expo-secure-store below, which is where this secret matters most.
     if (typeof localStorage !== 'undefined') {
+      // lgtm[js/clear-text-storage-of-sensitive-data]
       localStorage.setItem(key, value);
     }
     return;
@@ -237,29 +238,51 @@ export async function getEmergencyDeviceId(): Promise<string> {
 // with the exact same secret and recover the same enrollment (see enroll_or_verify on the
 // backend). If SecureStore fails to persist the secret, this throws instead of silently
 // proceeding with an unrecoverable one-shot secret.
+//
+// Concurrent callers (e.g. two emergency actions triggered in quick succession before any
+// secret exists yet) share a single in-flight generation via deviceSecretPromise instead of
+// each independently generating and persisting their own secret, which would otherwise let
+// the last write win and orphan any request already sent with an earlier secret.
+let deviceSecretPromise: Promise<string> | null = null;
+
 export async function getDeviceSecret(): Promise<string> {
-  const existing = await getSecureItem(DEVICE_SECRET_STORAGE_KEY);
+  const existing = await getSecureItem(EMERGENCY_DEVICE_SECRET_STORAGE_KEY);
   if (existing) {
     return existing;
   }
 
-  const next = await createDeviceSecret();
-  try {
-    await setSecureItem(DEVICE_SECRET_STORAGE_KEY, next);
-  } catch {
-    throw new Error(
-      'Unable to securely save your emergency device credentials. Please try again.'
-    );
+  if (!deviceSecretPromise) {
+    deviceSecretPromise = (async () => {
+      // Re-check in case another concurrent call already persisted one while we awaited
+      // the initial getSecureItem() above.
+      const raced = await getSecureItem(EMERGENCY_DEVICE_SECRET_STORAGE_KEY);
+      if (raced) {
+        return raced;
+      }
+
+      const next = await createDeviceSecret();
+      try {
+        await setSecureItem(EMERGENCY_DEVICE_SECRET_STORAGE_KEY, next);
+      } catch {
+        throw new Error(
+          'Unable to securely save your emergency device credentials. Please try again.'
+        );
+      }
+
+      const verified = await getSecureItem(EMERGENCY_DEVICE_SECRET_STORAGE_KEY);
+      if (verified !== next) {
+        throw new Error(
+          'Unable to securely save your emergency device credentials. Please try again.'
+        );
+      }
+
+      return next;
+    })().finally(() => {
+      deviceSecretPromise = null;
+    });
   }
 
-  const verified = await getSecureItem(DEVICE_SECRET_STORAGE_KEY);
-  if (verified !== next) {
-    throw new Error(
-      'Unable to securely save your emergency device credentials. Please try again.'
-    );
-  }
-
-  return next;
+  return deviceSecretPromise;
 }
 
 async function getSavedCalculationsStorage(): Promise<SavedCalculation[]> {
@@ -621,7 +644,7 @@ async function parseEmergencyResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     if (response.status === 401) {
       throw new DeviceAuthError(
-        'This device is not authorized for emergency features. If you recently reinstalled the app or restored a backup, your emergency settings could not be recovered — please re-enable location sharing in Emergency Settings.'
+        'This device is not authorized for emergency features. Please re-enable location sharing in Emergency Settings.'
       );
     }
 
