@@ -133,6 +133,10 @@ async function getSecureItem(key: string): Promise<string | null> {
 
 async function setSecureItem(key: string, value: string): Promise<void> {
   if (Platform.OS === 'web') {
+    // expo-secure-store has no encrypted backing store in a browser, so localStorage
+    // is the least-bad option there (same trade-off the pre-existing device-token
+    // storage made). Native builds always use the OS keychain/keystore via
+    // expo-secure-store below, which is where this secret matters most.
     if (typeof localStorage !== 'undefined') {
       localStorage.setItem(key, value);
     }
@@ -170,13 +174,15 @@ const bytesToHex = (bytes: Uint8Array): string =>
 const createDeviceSecret = async (): Promise<string> => {
   if (Platform.OS === 'web') {
     const bytes = new Uint8Array(32);
-    if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
-      crypto.getRandomValues(bytes);
-    } else {
-      for (let i = 0; i < bytes.length; i += 1) {
-        bytes[i] = Math.floor(Math.random() * 256);
-      }
+    if (typeof crypto === 'undefined' || typeof crypto.getRandomValues !== 'function') {
+      // Never fall back to Math.random() for an authentication secret — it isn't
+      // cryptographically secure. Fail loudly instead so the caller surfaces an error
+      // rather than silently enrolling with a guessable secret.
+      throw new Error(
+        'This browser does not support a secure random number generator required for emergency features.'
+      );
     }
+    crypto.getRandomValues(bytes);
     return bytesToHex(bytes);
   }
 
@@ -615,7 +621,7 @@ async function parseEmergencyResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     if (response.status === 401) {
       throw new DeviceAuthError(
-        'This device is not authorized for emergency features.'
+        'This device is not authorized for emergency features. If you recently reinstalled the app or restored a backup, your emergency settings could not be recovered — please re-enable location sharing in Emergency Settings.'
       );
     }
 
