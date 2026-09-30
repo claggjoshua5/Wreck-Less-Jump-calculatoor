@@ -31,7 +31,14 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-          cache: gradle
+          # NOTE: do not set `cache: gradle` here. This step runs before
+          # `expo prebuild` generates `frontend/android`, so there are no
+          # Gradle files yet for setup-java to hash. When no files match,
+          # setup-java's built-in Gradle cache restore fails the step
+          # outright (see "No file ... matched" in the job log), which
+          # then causes every later step, including the prebuild itself,
+          # to be skipped. Gradle caching is handled separately below,
+          # after the Android project actually exists.
 
       - name: Free runner disk space
         run: |
@@ -47,6 +54,17 @@ jobs:
       - name: Prebuild Android
         working-directory: frontend
         run: CI=1 npx expo prebuild --platform android --no-install
+
+      - name: Verify Android project was generated
+        run: |
+          if [ ! -f "frontend/android/gradlew" ]; then
+            echo "::error::expo prebuild did not generate frontend/android/gradlew. The Android project was not created, so the build cannot continue." >&2
+            exit 1
+          fi
+          if [ ! -f "frontend/android/app/build.gradle" ]; then
+            echo "::error::frontend/android/app/build.gradle is missing after prebuild. The generated Android project looks incomplete." >&2
+            exit 1
+          fi
 
       - name: Cache Gradle native outputs
         uses: actions/cache@v4
@@ -102,9 +120,43 @@ jobs:
             -Dorg.gradle.caching=true \
             -Dkotlin.compiler.execution.strategy=in-process
 
-      - name: List APK outputs
+      - name: Verify APK outputs are valid
         if: always()
-        run: find frontend/android -name "*.apk" -type f
+        run: |
+          set -e
+          if [ ! -d "frontend/android" ]; then
+            echo "::error::frontend/android does not exist, so no APKs could have been built. Check the earlier prebuild/verification steps for the real failure." >&2
+            exit 1
+          fi
+
+          echo "Searching for APK outputs under frontend/android..."
+          mapfile -t apks < <(find frontend/android -name "*.apk" -type f)
+
+          if [ "${#apks[@]}" -eq 0 ]; then
+            echo "::error::No APK files were produced under frontend/android/app/build/outputs/apk. The build did not complete successfully." >&2
+            exit 1
+          fi
+
+          for apk in "${apks[@]}"; do
+            size=$(stat -c%s "$apk")
+            echo "Found APK: $apk ($size bytes)"
+
+            if [ "$size" -eq 0 ]; then
+              echo "::error::$apk is empty (0 bytes). This is not a valid, installable APK." >&2
+              exit 1
+            fi
+
+            # A real APK is a ZIP archive containing AndroidManifest.xml.
+            # `unzip -l` fails if the file isn't a valid ZIP, and grep
+            # fails if the required entry is missing, so both catch
+            # corrupt/incomplete artifacts before they get uploaded.
+            if ! unzip -l "$apk" | grep -q "AndroidManifest.xml"; then
+              echo "::error::$apk does not look like a valid Android package (missing AndroidManifest.xml)." >&2
+              exit 1
+            fi
+          done
+
+          echo "All APK outputs look valid."
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4

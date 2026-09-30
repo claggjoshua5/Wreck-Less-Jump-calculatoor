@@ -146,11 +146,14 @@ Run `eas credentials` to set up a keystore. For testing, let EAS generate one au
 chmod +x android/gradlew
 ```
 
-### App won't install on Android
-Enable **Install Unknown Apps** for your browser or file manager in Android Settings → Apps → Special App Access.
+### App won't install on Android ("There was a problem parsing the package" / "something wrong with the object")
+This almost always means the `.apk` file itself is invalid — either it's empty/corrupted, or it came from a **failed** workflow run instead of a successful one. Before troubleshooting your phone:
+1. On the **Actions** tab, confirm the workflow run has a green checkmark. If the run failed (red ❌), any artifact from it is not a real APK — don't install it.
+2. Re-download the artifact from the latest successful run and try again.
+3. If it still won't install, enable **Install Unknown Apps** for your browser or file manager in Android Settings → Apps → Special App Access.
 
 ---
 
 ## CI/CD – GitHub Actions
 
-The repository includes a `.github/workflows/android-apk.yml` workflow that automatically builds a debug APK on every push to `main`. The resulting APK is available as a GitHub Actions artifact named **`debug-apk`** under the **Actions** tab of the repository.
+The repository includes a `.github/workflows/android-apk.yml` workflow that runs `expo prebuild` and then builds both a debug and a release APK on every push/PR to `main`/`master`, and on manual `workflow_dispatch`. The workflow fails loudly (instead of silently uploading a broken file) if the Android project isn't generated or if no valid, non-empty APK is produced. On success, the APKs are available as GitHub Actions artifacts named **`wreckless-jump-calculator-debug-apk`** and **`wreckless-jump-calculator-release-apk`** under the **Actions** tab of the repository. Only download and install artifacts from runs that completed successfully.
