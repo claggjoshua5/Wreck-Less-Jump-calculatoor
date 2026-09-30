@@ -1,12 +1,15 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Request
+from fastapi import FastAPI, APIRouter, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+import hashlib
+import hmac
 import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field
+import secrets
 from typing import List, Optional, Dict
 import uuid
 from datetime import datetime, timedelta
@@ -180,6 +183,26 @@ class EmergencySettings(BaseModel):
     alert_cooldown_ms: int = DEFAULT_ALERT_COOLDOWN_MS
     last_known_location: Optional[LocationData] = None
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class EmergencySettingsPublic(BaseModel):
+    device_id: str
+    allow_notifications: bool
+    location_sharing_enabled: bool
+    alert_cooldown_ms: int
+    has_location: bool
+    device_token: Optional[str] = None
+
+
+def to_public(settings: EmergencySettings, device_token: Optional[str] = None) -> EmergencySettingsPublic:
+    return EmergencySettingsPublic(
+        device_id=settings.device_id,
+        allow_notifications=settings.allow_notifications,
+        location_sharing_enabled=settings.location_sharing_enabled,
+        alert_cooldown_ms=settings.alert_cooldown_ms,
+        has_location=settings.last_known_location is not None,
+        device_token=device_token,
+    )
 
 
 class EmergencySettingsUpdate(BaseModel):
@@ -711,6 +734,7 @@ async def privacy_policy():
         <ul>
             <li><strong>Device Information:</strong> A unique device identifier to manage your subscription and saved calculations.</li>
             <li><strong>Location Data:</strong> If you choose to save a calculation with location, we store the GPS coordinates. This is optional and only collected with your permission.</li>
+            <li><strong>Emergency Location Data:</strong> If you enable emergency location sharing, we store your last known location and use it only to determine whether other opted-in riders are nearby when you request an alert. You can disable sharing at any time.</li>
             <li><strong>Calculation Data:</strong> Jump calculations you choose to save, including ramp measurements and results.</li>
             <li><strong>Payment Information:</strong> Processed securely through Stripe. We do not store your credit card details.</li>
             <li><strong>Camera Data:</strong> Photos taken for measurement are processed locally on your device and are not uploaded to our servers.</li>
@@ -966,21 +990,50 @@ async def clear_calculation_history():
 # NOTE: These endpoints never auto-dial or auto-broadcast on their own.
 # The frontend always requires an explicit, confirmed user action first.
 
-@api_router.get("/emergency/settings/{device_id}", response_model=EmergencySettings)
-async def get_emergency_settings(device_id: str):
+@api_router.get(
+    "/emergency/settings/{device_id}",
+    response_model=EmergencySettingsPublic,
+    response_model_exclude_none=True,
+)
+async def get_emergency_settings(
+    device_id: str,
+    device_token: Optional[str] = Header(None, alias="X-Device-Token"),
+):
     """Get a device's emergency alert preferences (location sharing, notifications, cooldown)."""
     normalized_device_id = require_device_id(device_id)
-    settings = await db.emergency_settings.find_one({"device_id": normalized_device_id})
-    if not settings:
-        return EmergencySettings(device_id=normalized_device_id)
-    return EmergencySettings(**settings)
+    settings = await verify_device(normalized_device_id, device_token)
+    return to_public(EmergencySettings(**settings))
 
 
-@api_router.post("/emergency/settings/{device_id}", response_model=EmergencySettings)
-async def update_emergency_settings(device_id: str, update: EmergencySettingsUpdate):
+async def verify_device(device_id: str, token: Optional[str]) -> Dict:
+    settings = await db.emergency_settings.find_one({"device_id": device_id})
+    token_hash = settings.get("token_hash") if settings else None
+    if not token_hash or not token or not hmac.compare_digest(token_hash, hashlib.sha256(token.encode()).hexdigest()):
+        raise HTTPException(status_code=401, detail="Invalid or missing device token.")
+    return settings
+
+
+@api_router.post(
+    "/emergency/settings/{device_id}",
+    response_model=EmergencySettingsPublic,
+    response_model_exclude_none=True,
+)
+async def update_emergency_settings(
+    device_id: str,
+    update: EmergencySettingsUpdate,
+    device_token: Optional[str] = Header(None, alias="X-Device-Token"),
+):
     """Update a device's emergency alert preferences."""
     normalized_device_id = require_device_id(device_id)
     existing = await db.emergency_settings.find_one({"device_id": normalized_device_id})
+    raw_device_token = None
+    if existing and existing.get("token_hash"):
+        await verify_device(normalized_device_id, device_token)
+        token_hash = existing["token_hash"]
+    else:
+        raw_device_token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(raw_device_token.encode()).hexdigest()
+
     settings = EmergencySettings(**existing) if existing else EmergencySettings(device_id=normalized_device_id)
 
     if update.allow_notifications is not None:
@@ -996,19 +1049,25 @@ async def update_emergency_settings(device_id: str, update: EmergencySettingsUpd
 
     settings.updated_at = datetime.utcnow()
 
+    settings_data = settings.dict()
+    settings_data["token_hash"] = token_hash
     await db.emergency_settings.update_one(
         {"device_id": normalized_device_id},
-        {"$set": settings.dict()},
+        {"$set": settings_data},
         upsert=True,
     )
-    return settings
+    return to_public(settings, raw_device_token)
 
 
 @api_router.post("/emergency/call-for-help", response_model=CallForHelpResponse)
-async def call_for_help(request: CallForHelpRequest):
+async def call_for_help(
+    request: CallForHelpRequest,
+    device_token: Optional[str] = Header(None, alias="X-Device-Token"),
+):
     """Log an emergency call attempt. The app never auto-dials; this only records that
     the user confirmed the action and was routed to their phone's dialer with 911 pre-filled."""
     normalized_device_id = require_device_id(request.device_id)
+    await verify_device(normalized_device_id, device_token)
     alert = EmergencyAlert(device_id=normalized_device_id, alert_type="call_for_help", location=request.location)
     await db.emergency_alerts.insert_one(alert.dict())
     return CallForHelpResponse(
@@ -1019,11 +1078,15 @@ async def call_for_help(request: CallForHelpRequest):
 
 
 @api_router.post("/emergency/alert-nearby-riders", response_model=AlertNearbyRidersResponse)
-async def alert_nearby_riders(request: AlertNearbyRidersRequest):
+async def alert_nearby_riders(
+    request: AlertNearbyRidersRequest,
+    device_token: Optional[str] = Header(None, alias="X-Device-Token"),
+):
     """Notify opted-in riders within 5 miles that help may be needed. Never broadcasts exact
     location publicly; only used server-side to determine which devices are nearby. Enforces a
     minimum cooldown between alerts from the same device to prevent spam."""
     normalized_device_id = require_device_id(request.device_id)
+    await verify_device(normalized_device_id, device_token)
 
     settings_doc = await db.emergency_settings.find_one({"device_id": normalized_device_id})
     cooldown_ms = (

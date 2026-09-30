@@ -78,6 +78,7 @@ export interface MapLocation {
 
 const LOCAL_SAVED_CALCULATIONS_KEY = 'wreckless_saved_calculations_v1';
 const DEVICE_ID_STORAGE_KEY = 'device_id';
+const DEVICE_TOKEN_STORAGE_KEY = 'device_token';
 const API_TIMEOUT_MS = 4000;
 const rawBackendUrl = process.env.EXPO_PUBLIC_BACKEND_URL?.trim() ?? '';
 const paywallFlag = process.env.EXPO_PUBLIC_ENABLE_PAYWALL?.trim().toLowerCase();
@@ -118,6 +119,13 @@ const storage = getStorage();
 const createId = (prefix: string) =>
   `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
+const createDeviceId = async () => {
+  const uuid = globalThis.crypto?.randomUUID
+    ? globalThis.crypto.randomUUID()
+    : await require('expo-crypto').randomUUID();
+  return `device_${uuid}`;
+};
+
 const createShareCode = () => Math.random().toString(36).slice(2, 10).toUpperCase();
 
 async function getStoredJson<T>(key: string, fallback: T): Promise<T> {
@@ -139,9 +147,30 @@ export async function getDeviceId(): Promise<string> {
     return existingDeviceId;
   }
 
-  const nextDeviceId = createId('device');
+  const nextDeviceId = await createDeviceId();
   await storage.setItem(DEVICE_ID_STORAGE_KEY, nextDeviceId);
   return nextDeviceId;
+}
+
+async function getDeviceToken(): Promise<string | null> {
+  if (Platform.OS === 'web') {
+    return typeof localStorage === 'undefined'
+      ? null
+      : localStorage.getItem(DEVICE_TOKEN_STORAGE_KEY);
+  }
+
+  return require('expo-secure-store').getItemAsync(DEVICE_TOKEN_STORAGE_KEY);
+}
+
+async function setDeviceToken(token: string): Promise<void> {
+  if (Platform.OS === 'web') {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(DEVICE_TOKEN_STORAGE_KEY, token);
+    }
+    return;
+  }
+
+  await require('expo-secure-store').setItemAsync(DEVICE_TOKEN_STORAGE_KEY, token);
 }
 
 async function getSavedCalculationsStorage(): Promise<SavedCalculation[]> {
@@ -464,6 +493,7 @@ export interface EmergencySettings {
   allow_notifications: boolean;
   location_sharing_enabled: boolean;
   alert_cooldown_ms: number;
+  has_location: boolean;
   last_known_location?: LocationData | null;
 }
 
@@ -482,26 +512,115 @@ export interface AlertNearbyRidersResult {
 
 const EMERGENCY_SETTINGS_STORAGE_KEY = 'wreckless_emergency_settings_v1';
 const LAST_NEARBY_ALERT_STORAGE_KEY = 'wreckless_last_nearby_alert_v1';
+const emergencySettingsPath = (deviceId: string) =>
+  `/api/emergency/settings/${encodeURIComponent(deviceId)}`;
+
+class DeviceAuthError extends Error {}
+
+async function parseEmergencyResponse<T>(response: Response): Promise<T> {
+  const contentType = response.headers.get('content-type') ?? '';
+  const responseBody = contentType.includes('application/json')
+    ? await response.json()
+    : await response.text();
+
+  if (!response.ok) {
+    if (response.status === 401) {
+      throw new DeviceAuthError(
+        'This device is not authorized for emergency features. Reinstall the app to create a new device identity.'
+      );
+    }
+
+    if (
+      responseBody &&
+      typeof responseBody === 'object' &&
+      'detail' in responseBody &&
+      typeof responseBody.detail === 'string'
+    ) {
+      throw new Error(responseBody.detail);
+    }
+
+    throw new Error(typeof responseBody === 'string' ? responseBody : 'Request failed');
+  }
+
+  if (responseBody && typeof responseBody === 'object' && 'device_token' in responseBody) {
+    if (typeof responseBody.device_token === 'string') {
+      await setDeviceToken(responseBody.device_token);
+    }
+    delete responseBody.device_token;
+  }
+
+  return responseBody as T;
+}
+
+async function fetchEmergencyJson<T>(
+  path: string,
+  deviceId: string,
+  init?: RequestInit
+): Promise<T> {
+  const makeRequest = async () => {
+    const token = await getDeviceToken();
+    return fetchWithBackend(path, {
+      ...init,
+      headers: {
+        ...(init?.headers as Record<string, string> | undefined),
+        ...(token ? { 'X-Device-Token': token } : {}),
+      },
+    });
+  };
+
+  let response = await makeRequest();
+  if (response.status !== 401) {
+    return parseEmergencyResponse<T>(response);
+  }
+
+  const token = await getDeviceToken();
+  const claimResponse = await fetchWithBackend(emergencySettingsPath(deviceId), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { 'X-Device-Token': token } : {}),
+    },
+    body: '{}',
+  });
+  const claimedSettings = await parseEmergencyResponse<EmergencySettings>(claimResponse);
+
+  if (path === emergencySettingsPath(deviceId) && (!init?.method || init.method === 'GET')) {
+    return claimedSettings as T;
+  }
+
+  response = await makeRequest();
+  return parseEmergencyResponse<T>(response);
+}
 
 const defaultEmergencySettings = (deviceId: string): EmergencySettings => ({
   device_id: deviceId,
   allow_notifications: true,
   location_sharing_enabled: false,
   alert_cooldown_ms: EMERGENCY_ALERT_COOLDOWN_MS,
+  has_location: false,
   last_known_location: null,
 });
 
 export async function getEmergencySettings(deviceId: string): Promise<EmergencySettings> {
   if (isBackendConfigured) {
     try {
-      return await fetchJsonWithBackend<EmergencySettings>(`/api/emergency/settings/${deviceId}`);
-    } catch {
+      return await fetchEmergencyJson<EmergencySettings>(emergencySettingsPath(deviceId), deviceId);
+    } catch (error) {
+      if (error instanceof DeviceAuthError) {
+        throw error;
+      }
       // Fall back to local storage below.
     }
   }
 
   const local = await getStoredJson<EmergencySettings | null>(EMERGENCY_SETTINGS_STORAGE_KEY, null);
-  return local ? { ...local, device_id: deviceId } : defaultEmergencySettings(deviceId);
+  return local
+    ? {
+        ...local,
+        device_id: deviceId,
+        has_location: local.last_known_location != null,
+      }
+    : defaultEmergencySettings(deviceId);
 }
 
 export async function updateEmergencySettings(
@@ -510,12 +629,15 @@ export async function updateEmergencySettings(
 ): Promise<EmergencySettings> {
   if (isBackendConfigured) {
     try {
-      return await fetchJsonWithBackend<EmergencySettings>(`/api/emergency/settings/${deviceId}`, {
+      return await fetchEmergencyJson<EmergencySettings>(emergencySettingsPath(deviceId), deviceId, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(update),
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof DeviceAuthError) {
+        throw error;
+      }
       // Fall back to local storage below.
     }
   }
@@ -533,6 +655,7 @@ export async function updateEmergencySettings(
         last_known_location: update.location,
       }),
   };
+  next.has_location = next.last_known_location != null;
 
   await setStoredJson(EMERGENCY_SETTINGS_STORAGE_KEY, next);
   return next;
@@ -544,7 +667,7 @@ export async function logCallForHelp(deviceId: string, location?: LocationData |
   }
 
   try {
-    await fetchJsonWithBackend('/api/emergency/call-for-help', {
+    await fetchEmergencyJson('/api/emergency/call-for-help', deviceId, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ device_id: deviceId, location: location ?? null }),
@@ -558,11 +681,15 @@ export async function sendNearbyRidersAlert(
   deviceId: string,
   location: LocationData
 ): Promise<AlertNearbyRidersResult> {
-  return fetchJsonWithBackend<AlertNearbyRidersResult>('/api/emergency/alert-nearby-riders', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ device_id: deviceId, location }),
-  });
+  return fetchEmergencyJson<AlertNearbyRidersResult>(
+    '/api/emergency/alert-nearby-riders',
+    deviceId,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device_id: deviceId, location }),
+    }
+  );
 }
 
 export async function getLastNearbyAlertSentAt(): Promise<number | null> {
