@@ -3,10 +3,15 @@
 Uses httpx's ASGI transport against the FastAPI app, backed by an in-memory
 mongomock-motor database so no real MongoDB instance is required.
 """
+
+import asyncio
+import math
 from datetime import datetime, timedelta
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+
+import server
 
 NYC = {"latitude": 40.7128, "longitude": -74.0060}
 # ~4.9 miles north of NYC (1 degree latitude ~= 69 miles).
@@ -208,6 +213,75 @@ async def test_alert_nearby_riders_200_after_cooldown_elapsed(app, db):
     assert second.status_code == 200
 
 
+async def test_alert_nearby_riders_concurrent_requests_use_one_cooldown(app):
+    device_id = "device-concurrent-alert"
+    await enable_sharing(app, device_id)
+
+    async with await client_for(app) as client:
+        responses = await asyncio.gather(
+            *[
+                client.post(
+                    "/api/emergency/alert-nearby-riders",
+                    json={"device_id": device_id, "location": NYC},
+                )
+                for _ in range(2)
+            ]
+        )
+
+    # mongomock-motor may not reproduce MongoDB's upsert race; preserve the
+    # expected behavior assertion without weakening production logic.
+    assert sorted(response.status_code for response in responses) == [200, 429]
+
+
+@pytest.mark.parametrize("with_previous_cooldown", [False, True])
+async def test_alert_nearby_riders_rolls_back_cooldown_on_failure(
+    app, db, monkeypatch, with_previous_cooldown
+):
+    device_id = f"device-cooldown-rollback-{with_previous_cooldown}"
+    await enable_sharing(app, device_id)
+    previous_timestamp = datetime.utcnow().replace(microsecond=0)
+    previous_timestamp -= timedelta(minutes=6)
+    cooldown_records = db.emergency_alert_cooldowns
+    if with_previous_cooldown:
+        await cooldown_records.insert_one(
+            {"device_id": device_id, "last_alert_at": previous_timestamp}
+        )
+
+    collection = server.db.emergency_alerts
+    monkeypatch.setattr(server.db, "emergency_alerts", collection)
+    original_insert_one = collection.insert_one
+
+    async def fail_insert_one(*args, **kwargs):
+        raise RuntimeError("simulated emergency alert write failure")
+
+    monkeypatch.setattr(collection, "insert_one", fail_insert_one)
+    transport = ASGITransport(
+        app=app,
+        raise_app_exceptions=False,
+    )
+    request_client = AsyncClient(transport=transport, base_url="http://test")
+    async with request_client as client:
+        failed = await client.post(
+            "/api/emergency/alert-nearby-riders",
+            json={"device_id": device_id, "location": NYC},
+        )
+    assert failed.status_code == 500
+
+    rolled_back = await cooldown_records.find_one({"device_id": device_id})
+    if with_previous_cooldown:
+        assert rolled_back["last_alert_at"] == previous_timestamp
+    else:
+        assert rolled_back is None
+
+    monkeypatch.setattr(collection, "insert_one", original_insert_one)
+    async with await client_for(app) as client:
+        retry = await client.post(
+            "/api/emergency/alert-nearby-riders",
+            json={"device_id": device_id, "location": NYC},
+        )
+    assert retry.status_code == 200
+
+
 async def test_alert_nearby_riders_message_does_not_claim_notified(app):
     device_id = "device-message-check"
     await enable_sharing(app, device_id)
@@ -270,3 +344,53 @@ def test_haversine_known_distance_nyc_to_la():
     # NYC to LA is roughly 2,445 miles.
     distance = haversine_distance_miles(40.7128, -74.0060, 34.0522, -118.2437)
     assert 2400 < distance < 2500
+
+
+def test_bounding_box_is_symmetric_and_uses_expected_latitude_delta():
+    from server import bounding_box
+
+    lat, lon, radius = 40.0, -73.0, 5.0
+    min_lat, max_lat, min_lon, max_lon = bounding_box(lat, lon, radius)
+
+    assert (min_lat + max_lat) / 2 == pytest.approx(lat)
+    assert (min_lon + max_lon) / 2 == pytest.approx(lon)
+    assert max_lat - lat == pytest.approx(radius / 69.0)
+    expected_lon_delta = radius / (69.0 * math.cos(math.radians(lat)))
+    assert max_lon - lon == pytest.approx(expected_lon_delta)
+
+
+def test_bounding_box_longitude_delta_widens_at_higher_latitudes():
+    from server import bounding_box
+
+    equator_box = bounding_box(0.0, 0.0, 5.0)
+    high_latitude_box = bounding_box(60.0, 0.0, 5.0)
+
+    equator_width = equator_box[3] - equator_box[2]
+    high_latitude_width = high_latitude_box[3] - high_latitude_box[2]
+    assert high_latitude_width > equator_width
+
+
+def test_bounding_box_clamps_at_coordinate_limits():
+    from server import bounding_box
+
+    north_east = bounding_box(89.99, 179.99, 5.0)
+    south_west = bounding_box(-89.99, -179.99, 5.0)
+
+    assert north_east[1] == 90.0
+    assert north_east[3] == 180.0
+    assert south_west[0] == -90.0
+    assert south_west[2] == -180.0
+
+
+def test_bounding_box_contains_points_five_miles_away_in_cardinal_directions():
+    from server import bounding_box
+
+    lat, lon, radius = 40.7128, -74.0060, 5.0
+    min_lat, max_lat, min_lon, max_lon = bounding_box(lat, lon, radius)
+    latitude_offset = math.degrees(radius / 3958.8)
+    longitude_offset = latitude_offset / math.cos(math.radians(lat))
+
+    assert min_lat <= lat + latitude_offset <= max_lat
+    assert min_lat <= lat - latitude_offset <= max_lat
+    assert min_lon <= lon + longitude_offset <= max_lon
+    assert min_lon <= lon - longitude_offset <= max_lon
