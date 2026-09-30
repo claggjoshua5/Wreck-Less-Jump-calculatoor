@@ -168,6 +168,57 @@ class ShareCalculationRequest(BaseModel):
     calculation_id: str
 
 
+# Emergency Alert Models
+DEFAULT_ALERT_COOLDOWN_MS = 5 * 60 * 1000  # 5 minutes
+NEARBY_RIDER_RADIUS_MILES = 5.0
+
+
+class EmergencySettings(BaseModel):
+    device_id: str
+    allow_notifications: bool = True
+    location_sharing_enabled: bool = False
+    alert_cooldown_ms: int = DEFAULT_ALERT_COOLDOWN_MS
+    last_known_location: Optional[LocationData] = None
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class EmergencySettingsUpdate(BaseModel):
+    allow_notifications: Optional[bool] = None
+    location_sharing_enabled: Optional[bool] = None
+    location: Optional[LocationData] = None
+
+
+class EmergencyAlert(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    device_id: str
+    alert_type: str  # "call_for_help" or "nearby_riders"
+    location: Optional[LocationData] = None
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+
+class CallForHelpRequest(BaseModel):
+    device_id: str
+    location: Optional[LocationData] = None
+
+
+class CallForHelpResponse(BaseModel):
+    success: bool
+    message: str
+    alert_id: str
+
+
+class AlertNearbyRidersRequest(BaseModel):
+    device_id: str
+    location: LocationData
+
+
+class AlertNearbyRidersResponse(BaseModel):
+    success: bool
+    message: str
+    alerted_count: int
+    alert_id: str
+
+
 def generate_trajectory_points(
     v_fps: float,
     theta_rad: float,
@@ -267,6 +318,16 @@ def require_device_id(device_id: Optional[str]) -> str:
     if not normalized_device_id:
         raise HTTPException(status_code=400, detail="device_id is required")
     return normalized_device_id
+
+
+def haversine_distance_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two lat/lon points, in miles."""
+    earth_radius_miles = 3958.8
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+    a = math.sin(delta_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
+    return 2 * earth_radius_miles * math.asin(min(1, math.sqrt(a)))
 
 
 def calculate_safety_margin(total_weight_lbs: float, ramp_height_ft: float, ramp_angle_deg: float) -> float:
@@ -899,6 +960,132 @@ async def clear_calculation_history():
     """Clear all calculation history."""
     result = await db.jump_calculations.delete_many({})
     return {"message": f"Deleted {result.deleted_count} calculations"}
+
+
+# ==================== EMERGENCY ALERT ENDPOINTS ====================
+# NOTE: These endpoints never auto-dial or auto-broadcast on their own.
+# The frontend always requires an explicit, confirmed user action first.
+
+@api_router.get("/emergency/settings/{device_id}", response_model=EmergencySettings)
+async def get_emergency_settings(device_id: str):
+    """Get a device's emergency alert preferences (location sharing, notifications, cooldown)."""
+    normalized_device_id = require_device_id(device_id)
+    settings = await db.emergency_settings.find_one({"device_id": normalized_device_id})
+    if not settings:
+        return EmergencySettings(device_id=normalized_device_id)
+    return EmergencySettings(**settings)
+
+
+@api_router.post("/emergency/settings/{device_id}", response_model=EmergencySettings)
+async def update_emergency_settings(device_id: str, update: EmergencySettingsUpdate):
+    """Update a device's emergency alert preferences."""
+    normalized_device_id = require_device_id(device_id)
+    existing = await db.emergency_settings.find_one({"device_id": normalized_device_id})
+    settings = EmergencySettings(**existing) if existing else EmergencySettings(device_id=normalized_device_id)
+
+    if update.allow_notifications is not None:
+        settings.allow_notifications = update.allow_notifications
+
+    if update.location_sharing_enabled is not None:
+        settings.location_sharing_enabled = update.location_sharing_enabled
+        if not update.location_sharing_enabled:
+            settings.last_known_location = None
+
+    if update.location is not None and settings.location_sharing_enabled:
+        settings.last_known_location = update.location
+
+    settings.updated_at = datetime.utcnow()
+
+    await db.emergency_settings.update_one(
+        {"device_id": normalized_device_id},
+        {"$set": settings.dict()},
+        upsert=True,
+    )
+    return settings
+
+
+@api_router.post("/emergency/call-for-help", response_model=CallForHelpResponse)
+async def call_for_help(request: CallForHelpRequest):
+    """Log an emergency call attempt. The app never auto-dials; this only records that
+    the user confirmed the action and was routed to their phone's dialer with 911 pre-filled."""
+    normalized_device_id = require_device_id(request.device_id)
+    alert = EmergencyAlert(device_id=normalized_device_id, alert_type="call_for_help", location=request.location)
+    await db.emergency_alerts.insert_one(alert.dict())
+    return CallForHelpResponse(
+        success=True,
+        message="Emergency call attempt logged. Always confirm the call in your phone's dialer.",
+        alert_id=alert.id,
+    )
+
+
+@api_router.post("/emergency/alert-nearby-riders", response_model=AlertNearbyRidersResponse)
+async def alert_nearby_riders(request: AlertNearbyRidersRequest):
+    """Notify opted-in riders within 5 miles that help may be needed. Never broadcasts exact
+    location publicly; only used server-side to determine which devices are nearby. Enforces a
+    minimum cooldown between alerts from the same device to prevent spam."""
+    normalized_device_id = require_device_id(request.device_id)
+
+    settings_doc = await db.emergency_settings.find_one({"device_id": normalized_device_id})
+    cooldown_ms = (
+        settings_doc.get("alert_cooldown_ms", DEFAULT_ALERT_COOLDOWN_MS)
+        if settings_doc
+        else DEFAULT_ALERT_COOLDOWN_MS
+    )
+
+    if settings_doc and settings_doc.get("location_sharing_enabled") is False:
+        raise HTTPException(
+            status_code=400,
+            detail="Enable location sharing in emergency settings before alerting nearby riders.",
+        )
+
+    recent_alerts = await db.emergency_alerts.find(
+        {"device_id": normalized_device_id, "alert_type": "nearby_riders"}
+    ).sort("timestamp", -1).limit(1).to_list(1)
+
+    if recent_alerts:
+        last_timestamp = recent_alerts[0]["timestamp"]
+        if isinstance(last_timestamp, str):
+            last_timestamp = datetime.fromisoformat(last_timestamp)
+        elapsed_ms = (datetime.utcnow() - last_timestamp).total_seconds() * 1000
+        if elapsed_ms < cooldown_ms:
+            remaining_seconds = max(1, int((cooldown_ms - elapsed_ms) / 1000))
+            raise HTTPException(
+                status_code=429,
+                detail=f"Please wait {remaining_seconds} more second(s) before sending another alert.",
+            )
+
+    alert = EmergencyAlert(device_id=normalized_device_id, alert_type="nearby_riders", location=request.location)
+    await db.emergency_alerts.insert_one(alert.dict())
+
+    nearby_settings = await db.emergency_settings.find(
+        {
+            "device_id": {"$ne": normalized_device_id},
+            "location_sharing_enabled": True,
+            "allow_notifications": True,
+            "last_known_location": {"$ne": None},
+        }
+    ).to_list(1000)
+
+    alerted_count = 0
+    for other in nearby_settings:
+        location = other.get("last_known_location")
+        if not location:
+            continue
+        distance_miles = haversine_distance_miles(
+            request.location.latitude,
+            request.location.longitude,
+            location["latitude"],
+            location["longitude"],
+        )
+        if distance_miles <= NEARBY_RIDER_RADIUS_MILES:
+            alerted_count += 1
+
+    return AlertNearbyRidersResponse(
+        success=True,
+        message=f"{alerted_count} nearby rider(s) notified. This is an unverified report — always call 911 for emergencies.",
+        alerted_count=alerted_count,
+        alert_id=alert.id,
+    )
 
 
 @api_router.post("/status", response_model=StatusCheck)

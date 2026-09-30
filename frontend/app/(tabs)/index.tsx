@@ -14,6 +14,7 @@ import {
   Modal,
   Share,
   Image,
+  Linking,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
@@ -25,11 +26,17 @@ import {
   CalculationResult,
   fetchJsonWithBackend,
   getDeviceId,
+  getEmergencySettings,
+  getLastNearbyAlertSentAt,
+  getRemainingAlertCooldownMs,
   isBackendConfigured,
   JumpCalculationInput,
   LocationData,
+  logCallForHelp,
   SavedCalculation,
   saveCalculationLocally,
+  sendNearbyRidersAlert,
+  setLastNearbyAlertSentAt,
 } from '@/lib/appSupport';
 
 const { width } = Dimensions.get('window');
@@ -58,6 +65,11 @@ export default function Index() {
   const [shareCalculation, setShareCalculation] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [currentLocation, setCurrentLocation] = useState<LocationData | null>(null);
+
+  // Emergency alert states
+  const [showCallHelpModal, setShowCallHelpModal] = useState(false);
+  const [showAlertRidersModal, setShowAlertRidersModal] = useState(false);
+  const [isSendingAlert, setIsSendingAlert] = useState(false);
 
   const loadCurrentLocation = async () => {
     try {
@@ -329,6 +341,90 @@ export default function Index() {
     }
 
     setShareCalculation(!shareCalculation);
+  };
+
+  const openCallHelpModal = () => {
+    setShowCallHelpModal(true);
+  };
+
+  const confirmCallForHelp = async () => {
+    setShowCallHelpModal(false);
+
+    try {
+      const deviceId = await getDeviceId();
+      const location = currentLocation ?? (await loadCurrentLocation());
+      // Fire-and-forget log; never blocks or delays opening the dialer.
+      logCallForHelp(deviceId, location);
+    } catch (error) {
+      console.log('Error logging call-for-help attempt:', error);
+    }
+
+    try {
+      // This only opens the phone dialer pre-filled with 911 — the user must
+      // still manually press "Call". The app never auto-dials.
+      await Linking.openURL('tel:911');
+    } catch {
+      Alert.alert('Unable to Open Dialer', 'Please dial 911 manually from your phone.');
+    }
+  };
+
+  const openAlertRidersModal = async () => {
+    try {
+      const deviceId = await getDeviceId();
+      const settings = await getEmergencySettings(deviceId);
+
+      if (!settings.location_sharing_enabled) {
+        Alert.alert(
+          'Location Sharing Required',
+          'Enable location sharing in Emergency Settings before alerting nearby riders. Your exact location is never broadcast — it is only used to privately check who is within 5 miles.'
+        );
+        return;
+      }
+
+      setShowAlertRidersModal(true);
+    } catch (error: any) {
+      Alert.alert('Error', error.message || 'Unable to check emergency settings.');
+    }
+  };
+
+  const confirmAlertNearbyRiders = async () => {
+    setShowAlertRidersModal(false);
+
+    const lastSentAt = await getLastNearbyAlertSentAt();
+    const remainingCooldownMs = getRemainingAlertCooldownMs(lastSentAt);
+    if (remainingCooldownMs > 0) {
+      Alert.alert(
+        'Please Wait',
+        `To prevent spam, you can send another rider alert in ${Math.ceil(remainingCooldownMs / 1000)} seconds.`
+      );
+      return;
+    }
+
+    setIsSendingAlert(true);
+    try {
+      const deviceId = await getDeviceId();
+      const location = currentLocation ?? (await loadCurrentLocation());
+
+      if (!location) {
+        throw new Error('Location is required to alert nearby riders. Please enable location access.');
+      }
+
+      if (isBackendConfigured) {
+        const response = await sendNearbyRidersAlert(deviceId, location);
+        await setLastNearbyAlertSentAt(Date.now());
+        Alert.alert('Alert Sent', response.message);
+      } else {
+        await setLastNearbyAlertSentAt(Date.now());
+        Alert.alert(
+          'Backend Unavailable',
+          'Nearby riders could not be notified because the backend is not configured. Always call 911 directly for real emergencies.'
+        );
+      }
+    } catch (error: any) {
+      Alert.alert('Error', error.message || 'Failed to send alert. Please try again or call 911 directly.');
+    } finally {
+      setIsSendingAlert(false);
+    }
   };
 
   const distanceUnit = useMetric ? 'm' : 'ft';
@@ -756,6 +852,43 @@ export default function Index() {
                   ))}
                 </View>
               )}
+
+              {/* Emergency Alerts */}
+              <View style={styles.emergencyContainer}>
+                <View style={styles.emergencyDisclaimer}>
+                  <Ionicons name="alert-circle-outline" size={16} color="#FF9800" />
+                  <Text style={styles.emergencyDisclaimerText}>
+                    This feature is NOT a substitute for calling 911. In emergencies, call 911 directly.
+                  </Text>
+                </View>
+
+                <TouchableOpacity
+                  style={styles.callHelpButton}
+                  onPress={openCallHelpModal}
+                  accessibilityRole="button"
+                  accessibilityLabel="Call for Help. Opens your phone dialer pre-filled with 911."
+                >
+                  <Ionicons name="alert-circle" size={26} color="#fff" />
+                  <Text style={styles.callHelpButtonText}>Call for Help</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={styles.alertRidersButton}
+                  onPress={openAlertRidersModal}
+                  disabled={isSendingAlert}
+                  accessibilityRole="button"
+                  accessibilityLabel="Alert Nearby Riders. Notifies opted-in riders within 5 miles that help may be needed."
+                >
+                  {isSendingAlert ? (
+                    <ActivityIndicator color="#fff" />
+                  ) : (
+                    <>
+                      <Ionicons name="heart" size={26} color="#fff" />
+                      <Text style={styles.alertRidersButtonText}>Alert Nearby Riders</Text>
+                    </>
+                  )}
+                </TouchableOpacity>
+              </View>
             </View>
           )}
 
@@ -857,6 +990,80 @@ export default function Index() {
                     <Text style={styles.saveButtonText}>Save Calculation</Text>
                   </>
                 )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Call for Help Confirmation Modal */}
+      <Modal
+        visible={showCallHelpModal}
+        animationType="fade"
+        transparent={true}
+        onRequestClose={() => setShowCallHelpModal(false)}
+      >
+        <View style={styles.confirmModalOverlay}>
+          <View style={styles.confirmModalContent}>
+            <Ionicons name="alert-circle" size={40} color="#E91E63" style={styles.confirmModalIcon} />
+            <Text style={styles.confirmModalTitle}>Are you injured?</Text>
+            <Text style={styles.confirmModalBody}>
+              You will be calling emergency services directly. This opens your phone&apos;s dialer
+              pre-filled with 911 — you must press Call to connect.
+            </Text>
+
+            <View style={styles.confirmModalActions}>
+              <TouchableOpacity
+                style={styles.confirmModalCancelButton}
+                onPress={() => setShowCallHelpModal(false)}
+              >
+                <Text style={styles.confirmModalCancelText}>Cancel</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.confirmModalCallButton}
+                onPress={confirmCallForHelp}
+              >
+                <Ionicons name="call" size={18} color="#fff" />
+                <Text style={styles.confirmModalCallText}>Call 911</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Alert Nearby Riders Confirmation Modal */}
+      <Modal
+        visible={showAlertRidersModal}
+        animationType="fade"
+        transparent={true}
+        onRequestClose={() => setShowAlertRidersModal(false)}
+      >
+        <View style={styles.confirmModalOverlay}>
+          <View style={styles.confirmModalContent}>
+            <Ionicons name="heart" size={40} color="#4CAF50" style={styles.confirmModalIcon} />
+            <Text style={styles.confirmModalTitle}>Alert nearby riders?</Text>
+            <Text style={styles.confirmModalBody}>
+              Other riders within 5 miles will be notified that help may be needed.
+            </Text>
+            <Text style={styles.confirmModalDisclaimer}>
+              This is an unverified report. Always call 911 for emergencies.
+            </Text>
+
+            <View style={styles.confirmModalActions}>
+              <TouchableOpacity
+                style={styles.confirmModalCancelButton}
+                onPress={() => setShowAlertRidersModal(false)}
+              >
+                <Text style={styles.confirmModalCancelText}>Cancel</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.confirmModalAlertButton}
+                onPress={confirmAlertNearbyRiders}
+              >
+                <Ionicons name="send" size={18} color="#fff" />
+                <Text style={styles.confirmModalAlertText}>Send Alert</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -1181,6 +1388,151 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: '#888',
     lineHeight: 18,
+  },
+  // Emergency alert styles
+  emergencyContainer: {
+    marginTop: 16,
+  },
+  emergencyDisclaimer: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    backgroundColor: 'rgba(255, 152, 0, 0.1)',
+    borderRadius: 12,
+    padding: 12,
+    gap: 8,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 152, 0, 0.3)',
+  },
+  emergencyDisclaimerText: {
+    flex: 1,
+    fontSize: 12,
+    color: '#FFB74D',
+    lineHeight: 16,
+    fontWeight: '600',
+  },
+  callHelpButton: {
+    backgroundColor: '#E91E63',
+    borderRadius: 12,
+    padding: 18,
+    minHeight: 56,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+    marginBottom: 12,
+  },
+  callHelpButtonText: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: 'bold',
+  },
+  alertRidersButton: {
+    backgroundColor: '#4CAF50',
+    borderRadius: 12,
+    padding: 18,
+    minHeight: 56,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+  },
+  alertRidersButtonText: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: 'bold',
+  },
+  confirmModalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.8)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 24,
+  },
+  confirmModalContent: {
+    width: '100%',
+    maxWidth: 400,
+    backgroundColor: '#1E1E1E',
+    borderRadius: 20,
+    padding: 24,
+    alignItems: 'center',
+  },
+  confirmModalIcon: {
+    marginBottom: 12,
+  },
+  confirmModalTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#fff',
+    marginBottom: 12,
+    textAlign: 'center',
+  },
+  confirmModalBody: {
+    fontSize: 14,
+    color: '#ccc',
+    textAlign: 'center',
+    lineHeight: 20,
+    marginBottom: 8,
+  },
+  confirmModalDisclaimer: {
+    fontSize: 12,
+    color: '#FF9800',
+    textAlign: 'center',
+    lineHeight: 18,
+    marginBottom: 8,
+    fontWeight: '600',
+  },
+  confirmModalActions: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 16,
+    width: '100%',
+  },
+  confirmModalCancelButton: {
+    flex: 1,
+    backgroundColor: '#2A2A2A',
+    borderRadius: 12,
+    padding: 16,
+    minHeight: 48,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  confirmModalCancelText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  confirmModalCallButton: {
+    flex: 1,
+    backgroundColor: '#E91E63',
+    borderRadius: 12,
+    padding: 16,
+    minHeight: 48,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  confirmModalCallText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  confirmModalAlertButton: {
+    flex: 1,
+    backgroundColor: '#4CAF50',
+    borderRadius: 12,
+    padding: 16,
+    minHeight: 48,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  confirmModalAlertText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: 'bold',
   },
   // Modal styles
   modalOverlay: {
