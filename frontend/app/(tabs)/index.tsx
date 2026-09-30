@@ -354,7 +354,12 @@ export default function Index() {
       const deviceId = await getDeviceId();
       const location = currentLocation ?? (await loadCurrentLocation());
       // Fire-and-forget log; never blocks or delays opening the dialer.
-      logCallForHelp(deviceId, location);
+      void logCallForHelp(deviceId, location).catch((error) => {
+        Alert.alert(
+          'Emergency Logging Unavailable',
+          error.message || 'This device is not authorized to log the emergency request.'
+        );
+      });
     } catch (error) {
       console.log('Error logging call-for-help attempt:', error);
     }
