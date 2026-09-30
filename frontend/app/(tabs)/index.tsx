@@ -26,6 +26,7 @@ import {
   CalculationResult,
   fetchJsonWithBackend,
   getDeviceId,
+  getEmergencyDeviceId,
   getEmergencySettings,
   getLastNearbyAlertSentAt,
   getRemainingAlertCooldownMs,
@@ -351,10 +352,10 @@ export default function Index() {
     setShowCallHelpModal(false);
 
     try {
-      const deviceId = await getDeviceId();
+      const emergencyDeviceId = await getEmergencyDeviceId();
       const location = currentLocation ?? (await loadCurrentLocation());
       // Fire-and-forget log; never blocks or delays opening the dialer.
-      void logCallForHelp(deviceId, location).catch((error) => {
+      void logCallForHelp(emergencyDeviceId, location).catch((error) => {
         Alert.alert(
           'Emergency Logging Unavailable',
           error.message || 'This device is not authorized to log the emergency request.'
@@ -375,8 +376,8 @@ export default function Index() {
 
   const openAlertRidersModal = async () => {
     try {
-      const deviceId = await getDeviceId();
-      const settings = await getEmergencySettings(deviceId);
+      const emergencyDeviceId = await getEmergencyDeviceId();
+      const settings = await getEmergencySettings(emergencyDeviceId);
 
       if (!settings.location_sharing_enabled) {
         Alert.alert(
@@ -407,7 +408,7 @@ export default function Index() {
 
     setIsSendingAlert(true);
     try {
-      const deviceId = await getDeviceId();
+      const emergencyDeviceId = await getEmergencyDeviceId();
       const location = currentLocation ?? (await loadCurrentLocation());
 
       if (!location) {
@@ -415,7 +416,7 @@ export default function Index() {
       }
 
       if (isBackendConfigured) {
-        const response = await sendNearbyRidersAlert(deviceId, location);
+        const response = await sendNearbyRidersAlert(emergencyDeviceId, location);
         await setLastNearbyAlertSentAt(Date.now());
         Alert.alert('Alert Sent', response.message);
       } else {

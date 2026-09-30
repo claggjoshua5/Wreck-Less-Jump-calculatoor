@@ -3,9 +3,10 @@
 Uses httpx's ASGI transport against the FastAPI app, backed by an in-memory
 mongomock-motor database so no real MongoDB instance is required.
 """
+import asyncio
+import hashlib
 from datetime import datetime, timedelta
 
-import pytest
 from httpx import ASGITransport, AsyncClient
 
 NYC = {"latitude": 40.7128, "longitude": -74.0060}
@@ -20,10 +21,11 @@ async def client_for(app):
     return AsyncClient(transport=transport, base_url="http://test")
 
 
-async def enable_sharing(app, device_id, location=NYC, allow_notifications=True):
+async def enable_sharing(app, emergency_device_id, token, location=NYC, allow_notifications=True):
     async with await client_for(app) as client:
         resp = await client.post(
-            f"/api/emergency/settings/{device_id}",
+            f"/api/emergency/settings/{emergency_device_id}",
+            headers={"X-Device-Token": token},
             json={
                 "location_sharing_enabled": True,
                 "allow_notifications": allow_notifications,
@@ -35,50 +37,146 @@ async def enable_sharing(app, device_id, location=NYC, allow_notifications=True)
 
 
 # ---------------------------------------------------------------------------
-# Settings endpoint
+# Enrollment: idempotency, retry-safety, concurrency
 # ---------------------------------------------------------------------------
 
-async def test_get_settings_unknown_device_returns_defaults(app):
-    async with await client_for(app) as client:
-        resp = await client.get("/api/emergency/settings/unknown-device")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["device_id"] == "unknown-device"
-    assert body["location_sharing_enabled"] is False
-    assert body["allow_notifications"] is True
-    assert body["last_known_location"] is None
+async def test_enroll_same_secret_twice_is_idempotent(app):
+    emergency_device_id = "emg-idempotent"
+    token = "secret-one"
+
+    first = await enable_sharing(app, emergency_device_id, token)
+    second = await enable_sharing(app, emergency_device_id, token, allow_notifications=False)
+
+    assert first["location_sharing_enabled"] is True
+    # Same secret on the existing record succeeds and settings can still be changed.
+    assert second["allow_notifications"] is False
+    assert second["location_sharing_enabled"] is True
 
 
-async def test_post_settings_sharing_off_clears_location(app):
-    device_id = "device-clear-location"
-    await enable_sharing(app, device_id)
+async def test_enroll_different_secret_on_existing_record_returns_401(app):
+    emergency_device_id = "emg-conflict"
+    await enable_sharing(app, emergency_device_id, "secret-one")
 
     async with await client_for(app) as client:
         resp = await client.post(
-            f"/api/emergency/settings/{device_id}",
+            f"/api/emergency/settings/{emergency_device_id}",
+            headers={"X-Device-Token": "secret-two"},
+            json={"location_sharing_enabled": True},
+        )
+    assert resp.status_code == 401
+
+
+async def test_lost_response_retry_with_same_secret_still_succeeds(app):
+    """Simulates a client that enrolled, never saw the (discarded) response, and retries
+    with the same locally-persisted secret. The retry must recover the same claim."""
+    emergency_device_id = "emg-retry"
+    token = "secret-retry"
+
+    first = await enable_sharing(app, emergency_device_id, token)
+    # Pretend the first response was lost/discarded by the client.
+    del first
+
+    retry = await enable_sharing(app, emergency_device_id, token)
+    assert retry["location_sharing_enabled"] is True
+
+
+async def test_concurrent_enrollment_same_secret_produces_one_document(app, db):
+    emergency_device_id = "emg-concurrent-same"
+    token = "same-secret"
+
+    async def do_post():
+        async with await client_for(app) as client:
+            return await client.post(
+                f"/api/emergency/settings/{emergency_device_id}",
+                headers={"X-Device-Token": token},
+                json={"location_sharing_enabled": True},
+            )
+
+    responses = await asyncio.gather(*[do_post() for _ in range(10)])
+    assert all(resp.status_code == 200 for resp in responses)
+
+    # NOTE: mongomock-motor cannot faithfully reproduce MongoDB's real unique-index /
+    # find_one_and_update race semantics (no true concurrent storage engine), so this
+    # mainly validates the idempotent-upsert code path rather than a genuine multi-process
+    # race. The production code (server.enroll_or_verify) relies on a real unique index
+    # plus $setOnInsert for correctness under true concurrency.
+    docs = await db.emergency_settings.find({"emergency_device_id": emergency_device_id}).to_list(100)
+    assert len(docs) == 1
+    assert docs[0]["token_hash"] == hashlib.sha256(token.encode()).hexdigest()
+
+
+async def test_concurrent_enrollment_different_secrets_exactly_one_winner(app, db):
+    emergency_device_id = "emg-concurrent-diff"
+
+    async def do_post(token):
+        async with await client_for(app) as client:
+            return await client.post(
+                f"/api/emergency/settings/{emergency_device_id}",
+                headers={"X-Device-Token": token},
+                json={"location_sharing_enabled": True},
+            )
+
+    tokens = [f"secret-{i}" for i in range(10)]
+    responses = await asyncio.gather(*[do_post(token) for token in tokens])
+
+    # See the concurrency caveat above: mongomock-motor serializes operations, so exactly
+    # one request "wins" here in practice, but this doesn't exercise a true storage-engine
+    # race. It still verifies that only one document is ever created and that every other
+    # secret is rejected against it.
+    successes = [r for r in responses if r.status_code == 200]
+    failures = [r for r in responses if r.status_code == 401]
+    assert len(successes) == 1
+    assert len(failures) == len(responses) - 1
+
+    docs = await db.emergency_settings.find({"emergency_device_id": emergency_device_id}).to_list(100)
+    assert len(docs) == 1
+
+
+# ---------------------------------------------------------------------------
+# Settings endpoint
+# ---------------------------------------------------------------------------
+
+async def test_get_settings_unauthenticated_unknown_device_returns_401(app):
+    async with await client_for(app) as client:
+        resp = await client.get("/api/emergency/settings/unknown-device")
+    assert resp.status_code == 401
+
+
+async def test_post_settings_sharing_off_clears_location(app):
+    emergency_device_id = "emg-clear-location"
+    token = "token-clear-location"
+    await enable_sharing(app, emergency_device_id, token)
+
+    async with await client_for(app) as client:
+        resp = await client.post(
+            f"/api/emergency/settings/{emergency_device_id}",
+            headers={"X-Device-Token": token},
             json={"location_sharing_enabled": False},
         )
     assert resp.status_code == 200
     body = resp.json()
     assert body["location_sharing_enabled"] is False
-    assert body["last_known_location"] is None
+    assert "last_known_location" not in body
 
 
 async def test_post_settings_location_ignored_when_sharing_off(app):
-    device_id = "device-ignore-location"
+    emergency_device_id = "emg-ignore-location"
+    token = "token-ignore-location"
     async with await client_for(app) as client:
         resp = await client.post(
-            f"/api/emergency/settings/{device_id}",
+            f"/api/emergency/settings/{emergency_device_id}",
+            headers={"X-Device-Token": token},
             json={"location_sharing_enabled": False, "location": NYC},
         )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["last_known_location"] is None
+    assert "last_known_location" not in body
+    assert body["has_location"] is False
 
 
 async def test_blank_device_id_returns_400(app):
     async with await client_for(app) as client:
-        resp = await client.get("/api/emergency/settings/%20")
+        resp = await client.get("/api/emergency/settings/%20", headers={"X-Device-Token": "x"})
     assert resp.status_code == 400
 
 
@@ -86,6 +184,7 @@ async def test_out_of_range_coordinates_return_422(app):
     async with await client_for(app) as client:
         resp = await client.post(
             "/api/emergency/settings/some-device",
+            headers={"X-Device-Token": "some-token"},
             json={
                 "location_sharing_enabled": True,
                 "location": {"latitude": 999, "longitude": -74.0060},
@@ -94,46 +193,85 @@ async def test_out_of_range_coordinates_return_422(app):
     assert resp.status_code == 422
 
 
+async def test_settings_responses_never_leak_private_fields(app):
+    emergency_device_id = "emg-private-fields"
+    token = "token-private-fields"
+    body = await enable_sharing(app, emergency_device_id, token)
+
+    forbidden_keys = {"latitude", "longitude", "last_known_location", "token_hash", "device_token", token}
+    assert forbidden_keys.isdisjoint(body.keys())
+    assert forbidden_keys.isdisjoint(str(v) for v in body.values())
+    assert body["has_location"] is True
+
+
 # ---------------------------------------------------------------------------
 # Call for help
 # ---------------------------------------------------------------------------
 
 async def test_call_for_help_returns_200_and_logs_alert(app, db):
-    device_id = "device-call-help"
+    emergency_device_id = "emg-call-help"
+    token = "token-call-help"
+    await enable_sharing(app, emergency_device_id, token)
+
     async with await client_for(app) as client:
         resp = await client.post(
             "/api/emergency/call-for-help",
-            json={"device_id": device_id, "location": NYC},
+            headers={"X-Device-Token": token},
+            json={"emergency_device_id": emergency_device_id, "location": NYC},
         )
     assert resp.status_code == 200
     body = resp.json()
     assert body["success"] is True
     assert body["alert_id"]
 
-    stored = await db.emergency_alerts.find_one({"device_id": device_id})
+    stored = await db.emergency_alerts.find_one({"emergency_device_id": emergency_device_id})
     assert stored is not None
     assert stored["alert_type"] == "call_for_help"
 
 
-async def test_call_for_help_stores_location_only_when_sharing_enabled(app, db):
-    sharing_device = "device-help-sharing-on"
-    await enable_sharing(app, sharing_device)
-    no_sharing_device = "device-help-sharing-off"
+async def test_call_for_help_requires_valid_token(app):
+    emergency_device_id = "emg-call-help-auth"
+    token = "token-call-help-auth"
+    await enable_sharing(app, emergency_device_id, token)
 
     async with await client_for(app) as client:
+        resp = await client.post(
+            "/api/emergency/call-for-help",
+            headers={"X-Device-Token": "wrong-token"},
+            json={"emergency_device_id": emergency_device_id, "location": NYC},
+        )
+    assert resp.status_code == 401
+
+
+async def test_call_for_help_stores_location_only_when_sharing_enabled(app, db):
+    sharing_device = "emg-help-sharing-on"
+    sharing_token = "token-help-sharing-on"
+    await enable_sharing(app, sharing_device, sharing_token)
+
+    no_sharing_device = "emg-help-sharing-off"
+    no_sharing_token = "token-help-sharing-off"
+    async with await client_for(app) as client:
+        await client.post(
+            f"/api/emergency/settings/{no_sharing_device}",
+            headers={"X-Device-Token": no_sharing_token},
+            json={"location_sharing_enabled": False},
+        )
+
         resp_on = await client.post(
             "/api/emergency/call-for-help",
-            json={"device_id": sharing_device, "location": NYC},
+            headers={"X-Device-Token": sharing_token},
+            json={"emergency_device_id": sharing_device, "location": NYC},
         )
         resp_off = await client.post(
             "/api/emergency/call-for-help",
-            json={"device_id": no_sharing_device, "location": NYC},
+            headers={"X-Device-Token": no_sharing_token},
+            json={"emergency_device_id": no_sharing_device, "location": NYC},
         )
     assert resp_on.status_code == 200
     assert resp_off.status_code == 200
 
-    stored_on = await db.emergency_alerts.find_one({"device_id": sharing_device})
-    stored_off = await db.emergency_alerts.find_one({"device_id": no_sharing_device})
+    stored_on = await db.emergency_alerts.find_one({"emergency_device_id": sharing_device})
+    stored_off = await db.emergency_alerts.find_one({"emergency_device_id": no_sharing_device})
     assert stored_on["location"] is not None
     assert stored_off["location"] is None
 
@@ -143,79 +281,89 @@ async def test_call_for_help_stores_location_only_when_sharing_enabled(app, db):
 # ---------------------------------------------------------------------------
 
 async def test_alert_nearby_riders_400_when_sharing_disabled(app):
-    device_id = "device-sharing-disabled"
+    emergency_device_id = "emg-sharing-disabled"
+    token = "token-sharing-disabled"
     async with await client_for(app) as client:
         await client.post(
-            f"/api/emergency/settings/{device_id}",
+            f"/api/emergency/settings/{emergency_device_id}",
+            headers={"X-Device-Token": token},
             json={"location_sharing_enabled": False},
         )
         resp = await client.post(
             "/api/emergency/alert-nearby-riders",
-            json={"device_id": device_id, "location": NYC},
+            headers={"X-Device-Token": token},
+            json={"emergency_device_id": emergency_device_id, "location": NYC},
         )
     assert resp.status_code == 400
 
 
-async def test_alert_nearby_riders_400_when_no_settings_doc(app):
-    device_id = "device-no-settings-doc"
+async def test_alert_nearby_riders_401_when_not_enrolled(app):
     async with await client_for(app) as client:
         resp = await client.post(
             "/api/emergency/alert-nearby-riders",
-            json={"device_id": device_id, "location": NYC},
+            json={"emergency_device_id": "emg-no-settings-doc", "location": NYC},
         )
-    assert resp.status_code == 400
+    assert resp.status_code == 401
 
 
 async def test_alert_nearby_riders_cooldown_then_success(app):
-    device_id = "device-cooldown"
-    await enable_sharing(app, device_id)
+    emergency_device_id = "emg-cooldown"
+    token = "token-cooldown"
+    await enable_sharing(app, emergency_device_id, token)
 
     async with await client_for(app) as client:
         first = await client.post(
             "/api/emergency/alert-nearby-riders",
-            json={"device_id": device_id, "location": NYC},
+            headers={"X-Device-Token": token},
+            json={"emergency_device_id": emergency_device_id, "location": NYC},
         )
         assert first.status_code == 200
 
         second = await client.post(
             "/api/emergency/alert-nearby-riders",
-            json={"device_id": device_id, "location": NYC},
+            headers={"X-Device-Token": token},
+            json={"emergency_device_id": emergency_device_id, "location": NYC},
         )
         assert second.status_code == 429
 
 
 async def test_alert_nearby_riders_200_after_cooldown_elapsed(app, db):
-    device_id = "device-cooldown-elapsed"
-    await enable_sharing(app, device_id)
+    emergency_device_id = "emg-cooldown-elapsed"
+    token = "token-cooldown-elapsed"
+    await enable_sharing(app, emergency_device_id, token)
 
     async with await client_for(app) as client:
         first = await client.post(
             "/api/emergency/alert-nearby-riders",
-            json={"device_id": device_id, "location": NYC},
+            headers={"X-Device-Token": token},
+            json={"emergency_device_id": emergency_device_id, "location": NYC},
         )
         assert first.status_code == 200
 
         # Simulate the cooldown having elapsed by rewinding the recorded timestamp.
         await db.emergency_alert_cooldowns.update_one(
-            {"device_id": device_id},
+            {"emergency_device_id": emergency_device_id},
             {"$set": {"last_alert_at": datetime.utcnow() - timedelta(minutes=6)}},
         )
 
         second = await client.post(
             "/api/emergency/alert-nearby-riders",
-            json={"device_id": device_id, "location": NYC},
+            headers={"X-Device-Token": token},
+            json={"emergency_device_id": emergency_device_id, "location": NYC},
         )
     assert second.status_code == 200
 
 
 async def test_alert_nearby_riders_message_does_not_claim_notified(app):
-    device_id = "device-message-check"
-    await enable_sharing(app, device_id)
+    emergency_device_id = "emg-message-check"
+    token = "token-message-check"
+    await enable_sharing(app, emergency_device_id, token)
 
     async with await client_for(app) as client:
         resp = await client.post(
             "/api/emergency/alert-nearby-riders",
-            json={"device_id": device_id, "location": NYC},
+            headers={"X-Device-Token": token},
+            json={"emergency_device_id": emergency_device_id, "location": NYC},
         )
     assert resp.status_code == 200
     body = resp.json()
@@ -226,32 +374,191 @@ async def test_alert_nearby_riders_message_does_not_claim_notified(app):
 
 
 async def test_alert_nearby_riders_radius_and_exclusions(app):
-    sender = "device-sender"
-    nearby = "device-nearby"
-    far = "device-far"
-    no_notifications = "device-no-notifications"
-    sharing_off = "device-sharing-off-excluded"
+    sender, sender_token = "emg-sender", "token-sender"
+    nearby, nearby_token = "emg-nearby", "token-nearby"
+    far, far_token = "emg-far", "token-far"
+    no_notifications, no_notifications_token = "emg-no-notifications", "token-no-notifications"
+    sharing_off, sharing_off_token = "emg-sharing-off-excluded", "token-sharing-off-excluded"
 
-    await enable_sharing(app, sender)
-    await enable_sharing(app, nearby, location=NEARBY_RIDER)
-    await enable_sharing(app, far, location=FAR_RIDER)
-    await enable_sharing(app, no_notifications, location=NYC, allow_notifications=False)
-    await enable_sharing(app, sharing_off, location=NYC)
+    await enable_sharing(app, sender, sender_token)
+    await enable_sharing(app, nearby, nearby_token, location=NEARBY_RIDER)
+    await enable_sharing(app, far, far_token, location=FAR_RIDER)
+    await enable_sharing(app, no_notifications, no_notifications_token, location=NYC, allow_notifications=False)
+    await enable_sharing(app, sharing_off, sharing_off_token, location=NYC)
     # Turn sharing back off for the last device, keeping allow_notifications True.
     async with await client_for(app) as client:
         await client.post(
             f"/api/emergency/settings/{sharing_off}",
+            headers={"X-Device-Token": sharing_off_token},
             json={"location_sharing_enabled": False},
         )
 
         resp = await client.post(
             "/api/emergency/alert-nearby-riders",
-            json={"device_id": sender, "location": NYC},
+            headers={"X-Device-Token": sender_token},
+            json={"emergency_device_id": sender, "location": NYC},
         )
 
     assert resp.status_code == 200
     body = resp.json()
     assert body["alerted_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Takeover regression: knowing the general device_id must not grant emergency access
+# ---------------------------------------------------------------------------
+
+async def test_general_device_id_cannot_authenticate_emergency_endpoints(app, db):
+    """A share-code holder learns the general device_id via GET /api/shared/{share_code}.
+    That value must be useless against the emergency endpoints, which key on the separate,
+    never-exposed emergency_device_id — and /api/shared never returns it."""
+    general_device_id = "device-general-12345"
+
+    calculation_payload = {
+        "device_id": general_device_id,
+        "name": "Big Jump",
+        "calculation": {
+            "input_data": {
+                "ramp_height": 3,
+                "ramp_angle": 30,
+                "gap_distance": 20,
+                "bike_weight": 250,
+                "rider_weight": 180,
+                "landing_height": 0,
+                "unit_system": "imperial",
+            },
+            "required_speed_mph": 25,
+            "required_speed_kph": 40,
+            "required_speed_fps": 36,
+            "total_weight_lbs": 430,
+            "total_weight_kg": 195,
+            "flight_time_seconds": 1.2,
+            "max_height_feet": 5,
+            "max_height_meters": 1.5,
+            "safety_speed_mph": 29,
+            "safety_speed_kph": 46,
+            "landing_velocity_mph": 20,
+            "landing_velocity_kph": 32,
+        },
+        "share": True,
+    }
+
+    # The rider also has real emergency settings, enrolled under a *different*,
+    # never-exposed emergency_device_id.
+    real_emergency_id = "emg-real-rider-identity"
+    real_token = "real-rider-secret"
+    await enable_sharing(app, real_emergency_id, real_token)
+
+    async with await client_for(app) as client:
+        save_resp = await client.post("/api/save-calculation", json=calculation_payload)
+        assert save_resp.status_code == 200, save_resp.text
+        saved = save_resp.json()
+        share_code = saved["share_code"]
+        assert saved["device_id"] == general_device_id
+
+        shared_resp = await client.get(f"/api/shared/{share_code}")
+        assert shared_resp.status_code == 200
+        shared_body = shared_resp.json()
+        assert shared_body["device_id"] == general_device_id
+        # The emergency identifier must never appear in a shared-calculation response.
+        assert "emergency_device_id" not in shared_body
+        assert real_emergency_id not in str(shared_body)
+
+        # Using the leaked general device_id as an emergency_device_id guess must not
+        # grant access to the rider's real emergency settings (a different, unrelated
+        # record — verified below by the 401).
+        auth_resp = await client.get(
+            f"/api/emergency/settings/{general_device_id}",
+            headers={"X-Device-Token": real_token},
+        )
+        assert auth_resp.status_code == 401
+
+        auth_resp_real = await client.get(
+            f"/api/emergency/settings/{real_emergency_id}",
+            headers={"X-Device-Token": real_token},
+        )
+        assert auth_resp_real.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Legacy rows: never claimable, excluded from nearby matching
+# ---------------------------------------------------------------------------
+
+async def test_legacy_row_cannot_be_claimed_via_old_device_id(app, db):
+    legacy_device_id = "legacy-rider-device-id"
+    await db.emergency_settings.insert_one(
+        {
+            "device_id": legacy_device_id,
+            "allow_notifications": True,
+            "location_sharing_enabled": True,
+            "alert_cooldown_ms": 300000,
+            "last_known_location": {"latitude": 40.7128, "longitude": -74.0060},
+        }
+    )
+
+    async with await client_for(app) as client:
+        # Any attacker (or the original rider) trying to authenticate against the legacy
+        # row's old device_id value must be rejected — it's never matched by emergency
+        # endpoints because they key exclusively on emergency_device_id.
+        get_resp = await client.get(
+            f"/api/emergency/settings/{legacy_device_id}",
+            headers={"X-Device-Token": "any-token"},
+        )
+        assert get_resp.status_code == 401
+
+        # A first "enrollment" attempt using that same string as emergency_device_id
+        # creates a brand-new, independent record (proving the legacy row itself was never
+        # touched/claimed) rather than taking over the legacy document's data.
+        enroll_resp = await client.post(
+            f"/api/emergency/settings/{legacy_device_id}",
+            headers={"X-Device-Token": "brand-new-secret"},
+            json={},
+        )
+        assert enroll_resp.status_code == 200
+        assert enroll_resp.json()["has_location"] is False
+
+    legacy_doc = await db.emergency_settings.find_one({"device_id": legacy_device_id})
+    assert legacy_doc is not None
+    assert "emergency_device_id" not in legacy_doc
+    assert legacy_doc["last_known_location"] == {"latitude": 40.7128, "longitude": -74.0060}
+
+
+async def test_legacy_row_excluded_from_nearby_matching_and_location_purged(app, db):
+    import server as server_module
+
+    legacy_device_id = "legacy-rider-excluded"
+    await db.emergency_settings.insert_one(
+        {
+            "device_id": legacy_device_id,
+            "allow_notifications": True,
+            "location_sharing_enabled": True,
+            "alert_cooldown_ms": 300000,
+            "last_known_location": NYC,
+        }
+    )
+
+    # The startup hook purges last_known_location from legacy rows (those lacking
+    # emergency_device_id); re-run it here since the fixture already ran it once before
+    # this row existed.
+    await server_module.create_indexes()
+
+    legacy_doc = await db.emergency_settings.find_one({"device_id": legacy_device_id})
+    assert "last_known_location" not in legacy_doc
+
+    sender = "emg-sender-vs-legacy"
+    token = "token-sender-vs-legacy"
+    await enable_sharing(app, sender, token)
+
+    async with await client_for(app) as client:
+        resp = await client.post(
+            "/api/emergency/alert-nearby-riders",
+            headers={"X-Device-Token": token},
+            json={"emergency_device_id": sender, "location": NYC},
+        )
+    assert resp.status_code == 200
+    # Only the sender itself is enrolled with emergency_device_id/token_hash; the legacy
+    # row (no matter how close its stale location is) must never be counted.
+    assert resp.json()["alerted_count"] == 0
 
 
 # ---------------------------------------------------------------------------
