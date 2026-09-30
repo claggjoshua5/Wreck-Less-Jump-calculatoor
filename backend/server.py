@@ -5,6 +5,8 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import hashlib
 import hmac
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 import os
 import logging
 from pathlib import Path
@@ -50,8 +52,8 @@ class StatusCheckCreate(BaseModel):
 
 # Location Model
 class LocationData(BaseModel):
-    latitude: float
-    longitude: float
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
     address: Optional[str] = None
 
 
@@ -351,6 +353,22 @@ def haversine_distance_miles(lat1: float, lon1: float, lat2: float, lon2: float)
     delta_lambda = math.radians(lon2 - lon1)
     a = math.sin(delta_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
     return 2 * earth_radius_miles * math.asin(min(1, math.sqrt(a)))
+
+
+def bounding_box(lat: float, lon: float, radius_miles: float):
+    """Rough lat/lon bounding box around a point, used as a cheap prefilter query before the
+    exact haversine check. Errs on the side of being slightly too generous rather than
+    excluding a rider that should match."""
+    miles_per_lat_degree = 69.0
+    lat_delta = radius_miles / miles_per_lat_degree
+    miles_per_lon_degree = max(miles_per_lat_degree * math.cos(math.radians(lat)), 1.0)
+    lon_delta = radius_miles / miles_per_lon_degree
+
+    min_lat = max(-90.0, lat - lat_delta)
+    max_lat = min(90.0, lat + lat_delta)
+    min_lon = max(-180.0, lon - lon_delta)
+    max_lon = min(180.0, lon + lon_delta)
+    return min_lat, max_lat, min_lon, max_lon
 
 
 def calculate_safety_margin(total_weight_lbs: float, ramp_height_ft: float, ramp_angle_deg: float) -> float:
@@ -1000,6 +1018,15 @@ async def get_emergency_settings(
     device_token: Optional[str] = Header(None, alias="X-Device-Token"),
 ):
     """Get a device's emergency alert preferences (location sharing, notifications, cooldown)."""
+@api_router.get("/emergency/settings/{device_id}", response_model=EmergencySettings)
+async def get_emergency_settings(device_id: str):
+    """Get a device's emergency alert preferences (location sharing, notifications, cooldown).
+
+    TODO(security): this endpoint has no authentication, so anyone who knows or guesses a
+    device_id can read that device's last_known_location. This needs a design decision
+    (auth / signed device token) before it can be considered safe; until then, either
+    protect this endpoint or stop returning last_known_location from it.
+    """
     normalized_device_id = require_device_id(device_id)
     settings = await verify_device(normalized_device_id, device_token)
     return to_public(EmergencySettings(**settings))
@@ -1065,10 +1092,15 @@ async def call_for_help(
     device_token: Optional[str] = Header(None, alias="X-Device-Token"),
 ):
     """Log an emergency call attempt. The app never auto-dials; this only records that
-    the user confirmed the action and was routed to their phone's dialer with 911 pre-filled."""
+    the user confirmed the action and was routed to their phone's dialer with 911 pre-filled.
+    Location is only stored if the device has opted into location sharing."""
     normalized_device_id = require_device_id(request.device_id)
     await verify_device(normalized_device_id, device_token)
     alert = EmergencyAlert(device_id=normalized_device_id, alert_type="call_for_help", location=request.location)
+    settings_doc = await db.emergency_settings.find_one({"device_id": normalized_device_id})
+    sharing_enabled = bool(settings_doc and settings_doc.get("location_sharing_enabled"))
+    stored_location = request.location if sharing_enabled else None
+    alert = EmergencyAlert(device_id=normalized_device_id, alert_type="call_for_help", location=stored_location)
     await db.emergency_alerts.insert_one(alert.dict())
     return CallForHelpResponse(
         success=True,
@@ -1085,40 +1117,62 @@ async def alert_nearby_riders(
     """Notify opted-in riders within 5 miles that help may be needed. Never broadcasts exact
     location publicly; only used server-side to determine which devices are nearby. Enforces a
     minimum cooldown between alerts from the same device to prevent spam."""
+async def alert_nearby_riders(request: AlertNearbyRidersRequest):
+    """Log that a rider requested nearby help. Never broadcasts exact location publicly;
+    only used server-side to count opted-in devices that are nearby. Enforces a minimum
+    cooldown between alerts from the same device to prevent spam.
+
+    NOTE: this only counts nearby devices and logs an alert — there is no push notification
+    or other delivery mechanism, so the response message must not claim riders were notified.
+    """
     normalized_device_id = require_device_id(request.device_id)
     await verify_device(normalized_device_id, device_token)
 
     settings_doc = await db.emergency_settings.find_one({"device_id": normalized_device_id})
-    cooldown_ms = (
-        settings_doc.get("alert_cooldown_ms", DEFAULT_ALERT_COOLDOWN_MS)
-        if settings_doc
-        else DEFAULT_ALERT_COOLDOWN_MS
-    )
 
-    if settings_doc and settings_doc.get("location_sharing_enabled") is False:
+    if not settings_doc or not settings_doc.get("location_sharing_enabled"):
         raise HTTPException(
             status_code=400,
             detail="Enable location sharing in emergency settings before alerting nearby riders.",
         )
 
-    recent_alerts = await db.emergency_alerts.find(
-        {"device_id": normalized_device_id, "alert_type": "nearby_riders"}
-    ).sort("timestamp", -1).limit(1).to_list(1)
+    cooldown_ms = settings_doc.get("alert_cooldown_ms", DEFAULT_ALERT_COOLDOWN_MS)
 
-    if recent_alerts:
-        last_timestamp = recent_alerts[0]["timestamp"]
-        if isinstance(last_timestamp, str):
-            last_timestamp = datetime.fromisoformat(last_timestamp)
-        elapsed_ms = (datetime.utcnow() - last_timestamp).total_seconds() * 1000
-        if elapsed_ms < cooldown_ms:
-            remaining_seconds = max(1, int((cooldown_ms - elapsed_ms) / 1000))
-            raise HTTPException(
-                status_code=429,
-                detail=f"Please wait {remaining_seconds} more second(s) before sending another alert.",
-            )
+    # Atomic upsert on a per-device cooldown record instead of check-then-insert, to avoid a
+    # race where two concurrent requests both read "no recent alert" and both proceed.
+    now = datetime.utcnow()
+    cutoff = now - timedelta(milliseconds=cooldown_ms)
+    try:
+        await db.emergency_alert_cooldowns.find_one_and_update(
+            {
+                "device_id": normalized_device_id,
+                "$or": [
+                    {"last_alert_at": {"$exists": False}},
+                    {"last_alert_at": {"$lte": cutoff}},
+                ],
+            },
+            {"$set": {"device_id": normalized_device_id, "last_alert_at": now}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        existing = await db.emergency_alert_cooldowns.find_one({"device_id": normalized_device_id})
+        last_alert_at = existing["last_alert_at"] if existing else now
+        if isinstance(last_alert_at, str):
+            last_alert_at = datetime.fromisoformat(last_alert_at)
+        elapsed_ms = (now - last_alert_at).total_seconds() * 1000
+        remaining_seconds = max(1, int((cooldown_ms - elapsed_ms) / 1000))
+        raise HTTPException(
+            status_code=429,
+            detail=f"Please wait {remaining_seconds} more second(s) before sending another alert.",
+        )
 
     alert = EmergencyAlert(device_id=normalized_device_id, alert_type="nearby_riders", location=request.location)
     await db.emergency_alerts.insert_one(alert.dict())
+
+    min_lat, max_lat, min_lon, max_lon = bounding_box(
+        request.location.latitude, request.location.longitude, NEARBY_RIDER_RADIUS_MILES
+    )
 
     nearby_settings = await db.emergency_settings.find(
         {
@@ -1126,6 +1180,8 @@ async def alert_nearby_riders(
             "location_sharing_enabled": True,
             "allow_notifications": True,
             "last_known_location": {"$ne": None},
+            "last_known_location.latitude": {"$gte": min_lat, "$lte": max_lat},
+            "last_known_location.longitude": {"$gte": min_lon, "$lte": max_lon},
         }
     ).to_list(1000)
 
@@ -1145,7 +1201,10 @@ async def alert_nearby_riders(
 
     return AlertNearbyRidersResponse(
         success=True,
-        message=f"{alerted_count} nearby rider(s) notified. This is an unverified report — always call 911 for emergencies.",
+        message=(
+            f"{alerted_count} nearby rider(s) in range. "
+            "This is an unverified report — always call 911 for emergencies."
+        ),
         alerted_count=alerted_count,
         alert_id=alert.id,
     )
@@ -1182,6 +1241,12 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+@app.on_event("startup")
+async def create_indexes():
+    # Unique index backing the atomic upsert used to guard the nearby-riders alert cooldown.
+    await db.emergency_alert_cooldowns.create_index("device_id", unique=True)
+
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
