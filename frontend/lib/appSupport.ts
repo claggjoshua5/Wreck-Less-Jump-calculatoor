@@ -674,6 +674,9 @@ export async function logCallForHelp(deviceId: string, location?: LocationData |
     });
   } catch (error) {
     console.log('Failed to log call-for-help attempt:', error);
+    if (error instanceof DeviceAuthError) {
+      throw error;
+    }
   }
 }
 
