@@ -43,6 +43,7 @@ class StatusCheck(BaseModel):
     client_name: str
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
+
 class StatusCheckCreate(BaseModel):
     client_name: str
 
@@ -333,12 +334,18 @@ def haversine_distance_miles(lat1: float, lon1: float, lat2: float, lon2: float)
 
 
 def bounding_box(lat: float, lon: float, radius_miles: float):
-    """Rough lat/lon bounding box around a point, used as a cheap prefilter query before the
-    exact haversine check. Errs on the side of being slightly too generous rather than
-    excluding a rider that should match."""
+    """Rough lat/lon box for prefiltering before the exact haversine check.
+
+    Errs on the side of being slightly too generous rather than excluding
+    a rider that should match.
+    """
+    # This does not handle wraparound across the antimeridian or the poles.
     miles_per_lat_degree = 69.0
     lat_delta = radius_miles / miles_per_lat_degree
-    miles_per_lon_degree = max(miles_per_lat_degree * math.cos(math.radians(lat)), 1.0)
+    miles_per_lon_degree = max(
+        miles_per_lat_degree * math.cos(math.radians(lat)),
+        1.0,
+    )
     lon_delta = radius_miles / miles_per_lon_degree
 
     min_lat = max(-90.0, lat - lat_delta)
@@ -1062,17 +1069,23 @@ async def alert_nearby_riders(request: AlertNearbyRidersRequest):
     if not settings_doc or not settings_doc.get("location_sharing_enabled"):
         raise HTTPException(
             status_code=400,
-            detail="Enable location sharing in emergency settings before alerting nearby riders.",
+            detail=(
+                "Enable location sharing in emergency settings before "
+                "alerting nearby riders."
+            ),
         )
 
     cooldown_ms = settings_doc.get("alert_cooldown_ms", DEFAULT_ALERT_COOLDOWN_MS)
 
-    # Atomic upsert on a per-device cooldown record instead of check-then-insert, to avoid a
-    # race where two concurrent requests both read "no recent alert" and both proceed.
+    # Atomic per-device upsert avoids concurrent requests both passing a
+    # check-then-insert.
     now = datetime.utcnow()
+    # MongoDB dates have millisecond precision for exact rollback matching.
+    now = now.replace(microsecond=(now.microsecond // 1000) * 1000)
     cutoff = now - timedelta(milliseconds=cooldown_ms)
+    cooldowns = db.emergency_alert_cooldowns
     try:
-        await db.emergency_alert_cooldowns.find_one_and_update(
+        previous_cooldown = await cooldowns.find_one_and_update(
             {
                 "device_id": normalized_device_id,
                 "$or": [
@@ -1080,12 +1093,19 @@ async def alert_nearby_riders(request: AlertNearbyRidersRequest):
                     {"last_alert_at": {"$lte": cutoff}},
                 ],
             },
-            {"$set": {"device_id": normalized_device_id, "last_alert_at": now}},
+            {
+                "$set": {
+                    "device_id": normalized_device_id,
+                    "last_alert_at": now,
+                }
+            },
             upsert=True,
-            return_document=ReturnDocument.AFTER,
+            return_document=ReturnDocument.BEFORE,
         )
     except DuplicateKeyError:
-        existing = await db.emergency_alert_cooldowns.find_one({"device_id": normalized_device_id})
+        existing = await db.emergency_alert_cooldowns.find_one(
+            {"device_id": normalized_device_id}
+        )
         last_alert_at = existing["last_alert_at"] if existing else now
         if isinstance(last_alert_at, str):
             last_alert_at = datetime.fromisoformat(last_alert_at)
@@ -1093,50 +1113,89 @@ async def alert_nearby_riders(request: AlertNearbyRidersRequest):
         remaining_seconds = max(1, int((cooldown_ms - elapsed_ms) / 1000))
         raise HTTPException(
             status_code=429,
-            detail=f"Please wait {remaining_seconds} more second(s) before sending another alert.",
+            detail=(
+                f"Please wait {remaining_seconds} more second(s) before "
+                "sending another alert."
+            ),
         )
 
-    alert = EmergencyAlert(device_id=normalized_device_id, alert_type="nearby_riders", location=request.location)
-    await db.emergency_alerts.insert_one(alert.dict())
+    try:
+        alert = EmergencyAlert(
+            device_id=normalized_device_id,
+            alert_type="nearby_riders",
+            location=request.location,
+        )
+        await db.emergency_alerts.insert_one(alert.dict())
 
-    min_lat, max_lat, min_lon, max_lon = bounding_box(
-        request.location.latitude, request.location.longitude, NEARBY_RIDER_RADIUS_MILES
-    )
-
-    nearby_settings = await db.emergency_settings.find(
-        {
-            "device_id": {"$ne": normalized_device_id},
-            "location_sharing_enabled": True,
-            "allow_notifications": True,
-            "last_known_location": {"$ne": None},
-            "last_known_location.latitude": {"$gte": min_lat, "$lte": max_lat},
-            "last_known_location.longitude": {"$gte": min_lon, "$lte": max_lon},
-        }
-    ).to_list(1000)
-
-    alerted_count = 0
-    for other in nearby_settings:
-        location = other.get("last_known_location")
-        if not location:
-            continue
-        distance_miles = haversine_distance_miles(
+        min_lat, max_lat, min_lon, max_lon = bounding_box(
             request.location.latitude,
             request.location.longitude,
-            location["latitude"],
-            location["longitude"],
+            NEARBY_RIDER_RADIUS_MILES,
         )
-        if distance_miles <= NEARBY_RIDER_RADIUS_MILES:
-            alerted_count += 1
 
-    return AlertNearbyRidersResponse(
-        success=True,
-        message=(
-            f"{alerted_count} nearby rider(s) in range. "
-            "This is an unverified report — always call 911 for emergencies."
-        ),
-        alerted_count=alerted_count,
-        alert_id=alert.id,
-    )
+        nearby_settings = await db.emergency_settings.find(
+            {
+                "device_id": {"$ne": normalized_device_id},
+                "location_sharing_enabled": True,
+                "allow_notifications": True,
+                "last_known_location": {"$ne": None},
+                "last_known_location.latitude": {
+                    "$gte": min_lat,
+                    "$lte": max_lat,
+                },
+                "last_known_location.longitude": {
+                    "$gte": min_lon,
+                    "$lte": max_lon,
+                },
+            }
+        ).to_list(1000)
+
+        alerted_count = 0
+        for other in nearby_settings:
+            location = other.get("last_known_location")
+            if not location:
+                continue
+            distance_miles = haversine_distance_miles(
+                request.location.latitude,
+                request.location.longitude,
+                location["latitude"],
+                location["longitude"],
+            )
+            if distance_miles <= NEARBY_RIDER_RADIUS_MILES:
+                alerted_count += 1
+
+        return AlertNearbyRidersResponse(
+            success=True,
+            message=(
+                f"{alerted_count} nearby rider(s) in range. "
+                "This is an unverified report — always call 911 for "
+                "emergencies."
+            ),
+            alerted_count=alerted_count,
+            alert_id=alert.id,
+        )
+    except Exception:
+        try:
+            cooldown_filter = {
+                "device_id": normalized_device_id,
+                "last_alert_at": now,
+            }
+            if previous_cooldown is None:
+                await cooldowns.delete_one(cooldown_filter)
+            elif "last_alert_at" in previous_cooldown:
+                previous_alert_at = previous_cooldown["last_alert_at"]
+                await cooldowns.update_one(
+                    cooldown_filter,
+                    {"$set": {"last_alert_at": previous_alert_at}},
+                )
+            else:
+                await cooldowns.update_one(
+                    cooldown_filter,
+                    {"$unset": {"last_alert_at": ""}},
+                )
+        except Exception:
+            logger.exception("Emergency alert cooldown rollback failed")
+        raise
 
 
 @api_router.post("/status", response_model=StatusCheck)
@@ -1170,6 +1229,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
 
 @app.on_event("startup")
 async def create_indexes():
