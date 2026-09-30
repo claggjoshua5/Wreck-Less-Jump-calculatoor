@@ -337,18 +337,19 @@ def get_payment_webhook_base_url(http_request: Request) -> str:
     return str(http_request.base_url).rstrip("/")
 
 
+def require_nonblank_id(value: Optional[str], field_name: str) -> str:
+    normalized = (value or "").strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail=f"{field_name} is required")
+    return normalized
+
+
 def require_device_id(device_id: Optional[str]) -> str:
-    normalized_device_id = (device_id or "").strip()
-    if not normalized_device_id:
-        raise HTTPException(status_code=400, detail="device_id is required")
-    return normalized_device_id
+    return require_nonblank_id(device_id, "device_id")
 
 
 def require_emergency_device_id(emergency_device_id: Optional[str]) -> str:
-    normalized = (emergency_device_id or "").strip()
-    if not normalized:
-        raise HTTPException(status_code=400, detail="emergency_device_id is required")
-    return normalized
+    return require_nonblank_id(emergency_device_id, "emergency_device_id")
 
 
 def haversine_distance_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:

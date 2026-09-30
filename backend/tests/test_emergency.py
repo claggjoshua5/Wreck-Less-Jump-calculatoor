@@ -524,6 +524,9 @@ async def test_legacy_row_cannot_be_claimed_via_old_device_id(app, db):
 
 
 async def test_legacy_row_excluded_from_nearby_matching_and_location_purged(app, db):
+    # Same module object conftest.py's `app`/`db` fixtures already imported and
+    # monkeypatched (sys.modules caches by name), so calling create_indexes() here runs
+    # against the same in-memory `db` used by the rest of this test.
     import server as server_module
 
     legacy_device_id = "legacy-rider-excluded"
