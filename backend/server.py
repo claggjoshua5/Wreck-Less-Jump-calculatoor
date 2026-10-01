@@ -1401,7 +1401,9 @@ async def create_indexes():
     # every missing value as null, so two or more such legacy rows collide and the
     # create_index call below raises DuplicateKeyError, aborting startup. Cooldowns are
     # short-lived (minutes), so it's safe to simply delete legacy rows that predate the
-    # new field; this also keeps the migration idempotent (no-op on later runs).
+    # new field; this also keeps the migration idempotent (no-op on later runs). Run
+    # unconditionally (not gated on device_id_1 above) since legacy rows can exist even
+    # if that index was already dropped in an earlier deploy.
     await db.emergency_alert_cooldowns.delete_many({"emergency_device_id": {"$exists": False}})
 
     # Unique index backing the atomic upsert used to guard the nearby-riders alert cooldown.
@@ -1432,15 +1434,27 @@ async def create_indexes():
     except OperationFailure as exc:
         if not _is_index_options_conflict_error(exc):
             raise
-        await db.emergency_alerts.drop_index("timestamp_ttl")
-        await db.emergency_alerts.create_index("timestamp", **ttl_kwargs)
+        # Multiple instances can run this startup code concurrently, so both the drop and
+        # the recreate below can themselves race with another instance doing the same
+        # thing; tolerate "already gone" on the drop and "someone else already recreated
+        # it the same way" on the second create, since both leave us in the desired state.
+        try:
+            await db.emergency_alerts.drop_index("timestamp_ttl")
+        except OperationFailure as drop_exc:
+            if not _is_index_not_found_error(drop_exc):
+                raise
+        try:
+            await db.emergency_alerts.create_index("timestamp", **ttl_kwargs)
+        except OperationFailure as recreate_exc:
+            if not _is_index_options_conflict_error(recreate_exc):
+                raise
 
-    # Backs the per-device write throttle in call_for_help (a find_one filtered on exactly
-    # these three fields, sorted by timestamp) so it doesn't degenerate into a collection
-    # scan as emergency_alerts grows between TTL expirations.
+    # Backs the per-device write throttle in call_for_help (a find_one_and_update filtered
+    # on exactly these three fields) so it doesn't degenerate into a collection scan as
+    # emergency_alerts grows between TTL expirations.
     await db.emergency_alerts.create_index(
         [("emergency_device_id", 1), ("alert_type", 1), ("timestamp", -1)],
-        name="emergency_device_id_1_alert_type_1_timestamp_-1",
+        name="call_for_help_throttle_idx",
     )
 
 
