@@ -1218,6 +1218,10 @@ async def call_for_help(
         },
         {"$setOnInsert": new_alert.dict()},
         upsert=True,
+        # Without a unique index here, more than one row could in principle match the
+        # window (e.g. leftover rows from before this throttle existed); sort so the
+        # most recent match is always what's returned/reused, making alert_id deterministic.
+        sort=[("timestamp", -1)],
         return_document=ReturnDocument.AFTER,
     )
     return CallForHelpResponse(success=True, message=message, alert_id=stored_alert["id"])
@@ -1377,6 +1381,34 @@ def _is_index_options_conflict_error(exc: OperationFailure) -> bool:
     return _operation_failure_matches(exc, 85, "IndexOptionsConflict", "already exists with different options")
 
 
+async def _ensure_ttl_index(collection, field: str, name: str, expire_after_seconds: int, max_attempts: int = 3):
+    """Idempotently create a TTL index, tolerating an existing index of the same name
+    with different options (e.g. a different retention window from an earlier deploy, or
+    another instance racing to apply the same migration concurrently) by dropping and
+    recreating it. Bounded retries instead of raising on conflict/race failures here:
+    unlike the legacy cooldown index (which must be gone for correctness), a TTL
+    retention window is not safety-critical, so we log and move on rather than aborting
+    startup if we can't converge it within a few attempts."""
+    kwargs = {"name": name, "expireAfterSeconds": expire_after_seconds}
+    for _ in range(max_attempts):
+        try:
+            await collection.create_index(field, **kwargs)
+            return
+        except OperationFailure as exc:
+            if not _is_index_options_conflict_error(exc):
+                raise
+            try:
+                await collection.drop_index(name)
+            except OperationFailure as drop_exc:
+                if not _is_index_not_found_error(drop_exc):
+                    raise
+    logger.warning(
+        "Could not converge TTL index %r on %s to expireAfterSeconds=%s after %d attempt(s); "
+        "leaving whatever index currently exists in place.",
+        name, field, expire_after_seconds, max_attempts,
+    )
+
+
 @app.on_event("startup")
 async def create_indexes():
     # Safely drop legacy unique index on device_id from PR #29 if present.
@@ -1425,29 +1457,12 @@ async def create_indexes():
 
     # TTL index so unauthenticated call-for-help rows (see call_for_help) and other
     # emergency_alerts rows don't accumulate forever. EmergencyAlert.timestamp is a real
-    # datetime (required by TTL indexes). Guard against a pre-existing index of the same
-    # name with different options (e.g. a different retention window from an earlier
-    # deploy) so startup doesn't crash; drop and recreate it with the current options.
-    ttl_kwargs = {"name": "timestamp_ttl", "expireAfterSeconds": EMERGENCY_ALERT_RETENTION_SECONDS}
-    try:
-        await db.emergency_alerts.create_index("timestamp", **ttl_kwargs)
-    except OperationFailure as exc:
-        if not _is_index_options_conflict_error(exc):
-            raise
-        # Multiple instances can run this startup code concurrently, so both the drop and
-        # the recreate below can themselves race with another instance doing the same
-        # thing; tolerate "already gone" on the drop and "someone else already recreated
-        # it the same way" on the second create, since both leave us in the desired state.
-        try:
-            await db.emergency_alerts.drop_index("timestamp_ttl")
-        except OperationFailure as drop_exc:
-            if not _is_index_not_found_error(drop_exc):
-                raise
-        try:
-            await db.emergency_alerts.create_index("timestamp", **ttl_kwargs)
-        except OperationFailure as recreate_exc:
-            if not _is_index_options_conflict_error(recreate_exc):
-                raise
+    # datetime (required by TTL indexes). _ensure_ttl_index handles a pre-existing index
+    # of the same name with different options (e.g. a different retention window from an
+    # earlier deploy, or a concurrently-starting instance) without crashing startup.
+    await _ensure_ttl_index(
+        db.emergency_alerts, "timestamp", "timestamp_ttl", EMERGENCY_ALERT_RETENTION_SECONDS
+    )
 
     # Backs the per-device write throttle in call_for_help (a find_one_and_update filtered
     # on exactly these three fields) so it doesn't degenerate into a collection scan as
