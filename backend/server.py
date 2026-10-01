@@ -1193,17 +1193,8 @@ async def call_for_help(
     message = "Emergency call attempt logged. Always confirm the call in your phone's dialer."
 
     # This endpoint intentionally accepts unenrolled/unauthenticated callers (a rider in an
-    # emergency must never be blocked), so it must stay cheap to spam. Throttle writes per
-    # emergency_device_id instead of rejecting the request: if this ID already logged a
-    # call_for_help alert within CALL_FOR_HELP_THROTTLE_SECONDS, reuse that row instead of
-    # inserting another one, still returning the normal 200 response. Implemented as a single
-    # atomic find_one_and_update upsert (same idea as the nearby-riders cooldown) rather than
-    # a separate find_one + insert_one, so there's no check-then-insert race window: either an
-    # existing in-window row is matched (no-op), or $setOnInsert creates exactly one new row.
-    # We deliberately don't add a new unique index for this (unlike the cooldown collection);
-    # worst case under unusual concurrency is one extra duplicate row, which the TTL index on
-    # `timestamp` (see create_indexes) still cleans up. Real per-IP rate limiting would need
-    # infrastructure (reverse proxy / middleware) and is intentionally out of scope here.
+    # emergency must never be blocked). A uniquely keyed per-device throttle document bounds
+    # writes while every valid call still receives the normal success response.
     now = datetime.utcnow()
     throttle_cutoff = now - timedelta(seconds=CALL_FOR_HELP_THROTTLE_SECONDS)
     new_alert = EmergencyAlert(
@@ -1212,26 +1203,69 @@ async def call_for_help(
         location=stored_location,
         timestamp=now,
     )
-    # NOTE: this query/upsert has no unique index backing it (see comment above), so it is
-    # NOT a hard uniqueness guarantee like the nearby-riders cooldown -- under concurrency
-    # or with pre-existing rows, more than one document could match this filter at once.
-    # That's an accepted tradeoff here (TTL-cleaned duplicates are harmless), but a future
-    # change to this query must not assume exactly one row ever matches.
-    stored_alert = await db.emergency_alerts.find_one_and_update(
-        {
-            "emergency_device_id": normalized_id,
-            "alert_type": "call_for_help",
-            "timestamp": {"$gte": throttle_cutoff},
-        },
-        {"$setOnInsert": new_alert.dict()},
-        upsert=True,
-        # Without a unique index here, more than one row could in principle match the
-        # window (e.g. leftover rows from before this throttle existed); sort so the
-        # most recent match is always what's returned/reused, making alert_id deterministic.
-        sort=[("timestamp", -1)],
-        return_document=ReturnDocument.AFTER,
-    )
-    return CallForHelpResponse(success=True, message=message, alert_id=stored_alert["id"])
+    location_data = stored_location.dict() if stored_location else None
+    throttles = db.emergency_call_throttles
+    throttle_state = {
+        "emergency_device_id": normalized_id,
+        "alert_id": new_alert.id,
+        "timestamp": now,
+        "location": location_data,
+    }
+    create_alert = False
+    throttle_doc = None
+    while throttle_doc is None:
+        try:
+            await throttles.insert_one(throttle_state)
+            throttle_doc = throttle_state
+            create_alert = True
+        except DuplicateKeyError:
+            # Updating only an expired state makes this the sole request that starts a new
+            # window. Concurrent requests that lose this update reuse the winner's alert id.
+            throttle_doc = await throttles.find_one_and_update(
+                {
+                    "emergency_device_id": normalized_id,
+                    "timestamp": {"$lt": throttle_cutoff},
+                },
+                {"$set": throttle_state},
+                return_document=ReturnDocument.AFTER,
+            )
+            if throttle_doc:
+                create_alert = True
+            else:
+                if location_data:
+                    await throttles.update_one(
+                        {
+                            "emergency_device_id": normalized_id,
+                            "timestamp": {"$gte": throttle_cutoff},
+                        },
+                        {"$set": {"location": location_data}},
+                    )
+                throttle_doc = await throttles.find_one(
+                    {"emergency_device_id": normalized_id}
+                )
+
+    if create_alert:
+        await db.emergency_alerts.insert_one(new_alert.dict())
+
+    alert_id = throttle_doc["alert_id"]
+    if create_alert:
+        # An authenticated request may have enriched the throttle state before its
+        # corresponding alert row was inserted.
+        latest_state = await throttles.find_one(
+            {"emergency_device_id": normalized_id}
+        )
+        if latest_state and latest_state.get("location"):
+            await db.emergency_alerts.update_one(
+                {"id": alert_id},
+                {"$set": {"location": latest_state["location"]}},
+            )
+    elif location_data:
+        await db.emergency_alerts.update_one(
+            {"id": alert_id},
+            {"$set": {"location": location_data}},
+        )
+
+    return CallForHelpResponse(success=True, message=message, alert_id=alert_id)
 
 
 @api_router.post("/emergency/alert-nearby-riders", response_model=AlertNearbyRidersResponse)
@@ -1369,10 +1403,15 @@ def _operation_failure_matches(exc: OperationFailure, code: int, code_name: str,
     mongomock-motor (used in tests) raises OperationFailure for the same situations but
     often without a code/codeName, so fall back to sniffing `message_substring` in the
     error text in that case."""
-    if getattr(exc, "code", None) == code:
-        return True
-    if getattr(exc, "codeName", None) == code_name:
-        return True
+    error_code = getattr(exc, "code", None)
+    if error_code is not None:
+        return error_code == code
+
+    error_code_name = getattr(exc, "codeName", None)
+    details = getattr(exc, "details", None)
+    details_code_name = details.get("codeName") if isinstance(details, dict) else None
+    if error_code_name is not None or details_code_name is not None:
+        return code_name in (error_code_name, details_code_name)
     return message_substring in str(exc).lower()
 
 
@@ -1404,15 +1443,15 @@ async def _ensure_ttl_index(collection, field: str, name: str, expire_after_seco
         except OperationFailure as exc:
             if not _is_index_options_conflict_error(exc):
                 raise
-            try:
-                await collection.drop_index(name)
-            except OperationFailure as drop_exc:
-                if not _is_index_not_found_error(drop_exc):
-                    raise
-            # Dropped (or it was already gone). A brief, jittered backoff before retrying
-            # reduces the chance that two instances racing to converge this index keep
-            # colliding with each other on every attempt.
             if attempt < max_attempts - 1:
+                try:
+                    await collection.drop_index(name)
+                except OperationFailure as drop_exc:
+                    if not _is_index_not_found_error(drop_exc):
+                        raise
+                # Dropped (or it was already gone). A brief, jittered backoff before retrying
+                # reduces the chance that two instances racing to converge this index keep
+                # colliding with each other on every attempt.
                 await asyncio.sleep(random.uniform(0.05, 0.2))
     logger.warning(
         "Could not converge TTL index %r on %s to expireAfterSeconds=%s after %d attempt(s); "
@@ -1476,12 +1515,15 @@ async def create_indexes():
         db.emergency_alerts, "timestamp", "timestamp_ttl", EMERGENCY_ALERT_RETENTION_SECONDS
     )
 
-    # Backs the per-device write throttle in call_for_help (a find_one_and_update filtered
-    # on exactly these three fields) so it doesn't degenerate into a collection scan as
-    # emergency_alerts grows between TTL expirations.
-    await db.emergency_alerts.create_index(
-        [("emergency_device_id", 1), ("alert_type", 1), ("timestamp", -1)],
-        name="call_for_help_throttle_idx",
+    # One state per device makes the call-for-help throttle safe under concurrent requests.
+    await db.emergency_call_throttles.create_index(
+        "emergency_device_id", unique=True, name="emergency_device_id_1"
+    )
+    await _ensure_ttl_index(
+        db.emergency_call_throttles,
+        "timestamp",
+        "timestamp_ttl",
+        EMERGENCY_ALERT_RETENTION_SECONDS,
     )
 
 
