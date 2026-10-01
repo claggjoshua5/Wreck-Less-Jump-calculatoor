@@ -175,6 +175,13 @@ class ShareCalculationRequest(BaseModel):
 # Emergency Alert Models
 DEFAULT_ALERT_COOLDOWN_MS = 5 * 60 * 1000  # 5 minutes
 NEARBY_RIDER_RADIUS_MILES = 5.0
+# Minimum time between two call-for-help rows logged for the same emergency_device_id.
+# This is a basic write throttle only (see call_for_help); real per-IP rate limiting
+# needs infrastructure (reverse proxy / middleware) and is out of scope here.
+CALL_FOR_HELP_THROTTLE_SECONDS = 10
+# Unauthenticated call-for-help rows must not accumulate forever; TTL-expire them from
+# emergency_alerts after this many seconds (30 days).
+EMERGENCY_ALERT_RETENTION_SECONDS = 30 * 24 * 60 * 60
 
 
 class EmergencySettings(BaseModel):
@@ -1181,17 +1188,38 @@ async def call_for_help(
 
     sharing_enabled = is_authenticated and bool(settings_doc and settings_doc.get("location_sharing_enabled"))
     stored_location = request.location if sharing_enabled else None
+    message = "Emergency call attempt logged. Always confirm the call in your phone's dialer."
+
+    # This endpoint intentionally accepts unenrolled/unauthenticated callers (a rider in an
+    # emergency must never be blocked), so it must stay cheap to spam. Throttle writes per
+    # emergency_device_id instead of rejecting the request: if this ID already logged a
+    # call_for_help alert within CALL_FOR_HELP_THROTTLE_SECONDS, reuse that row's id and skip
+    # the insert, still returning the normal 200 response. A find_one-then-insert has a small
+    # race window under concurrency, but the worst case is a few extra duplicate rows during
+    # a burst, which the TTL index on `timestamp` (see create_indexes) still cleans up -- it
+    # is not a correctness issue worth a new unique index for. Real per-IP rate limiting would
+    # need infrastructure (reverse proxy / middleware) and is intentionally out of scope here.
+    now = datetime.utcnow()
+    throttle_cutoff = now - timedelta(seconds=CALL_FOR_HELP_THROTTLE_SECONDS)
+    recent_alert = await db.emergency_alerts.find_one(
+        {
+            "emergency_device_id": normalized_id,
+            "alert_type": "call_for_help",
+            "timestamp": {"$gte": throttle_cutoff},
+        },
+        sort=[("timestamp", -1)],
+    )
+    if recent_alert:
+        return CallForHelpResponse(success=True, message=message, alert_id=recent_alert["id"])
+
     alert = EmergencyAlert(
         emergency_device_id=normalized_id,
         alert_type="call_for_help",
         location=stored_location,
+        timestamp=now,
     )
     await db.emergency_alerts.insert_one(alert.dict())
-    return CallForHelpResponse(
-        success=True,
-        message="Emergency call attempt logged. Always confirm the call in your phone's dialer.",
-        alert_id=alert.id,
-    )
+    return CallForHelpResponse(success=True, message=message, alert_id=alert.id)
 
 
 @api_router.post("/emergency/alert-nearby-riders", response_model=AlertNearbyRidersResponse)
@@ -1324,22 +1352,44 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def _is_index_not_found_error(exc: OperationFailure) -> bool:
+    """True if `exc` represents MongoDB's "index not found" failure (code 27 /
+    codeName IndexNotFound), which is safe to ignore when dropping a legacy index.
+    mongomock-motor (used in tests) raises OperationFailure for the same situation but
+    without a code/codeName, so fall back to sniffing the message in that case."""
+    if getattr(exc, "code", None) == 27:
+        return True
+    if getattr(exc, "codeName", None) == "IndexNotFound":
+        return True
+    return "index not found" in str(exc).lower()
+
+
 @app.on_event("startup")
 async def create_indexes():
     # Safely drop legacy unique index on device_id from PR #29 if present.
     # New cooldown documents are keyed by emergency_device_id and omit device_id;
     # a pre-existing unique index on device_id treats missing values as null and
     # causes duplicate key errors (and false 429s) for subsequent riders.
-    try:
-        cooldown_indexes = await db.emergency_alert_cooldowns.index_information()
-        if "device_id_1" in cooldown_indexes:
-            try:
-                await db.emergency_alert_cooldowns.drop_index("device_id_1")
-            except OperationFailure:
-                # Ignore "index not found" if dropped concurrently or absent
-                pass
-    except Exception as exc:
-        logger.warning("Error checking or dropping legacy cooldown index: %s", exc)
+    cooldown_indexes = await db.emergency_alert_cooldowns.index_information()
+    if "device_id_1" in cooldown_indexes:
+        try:
+            await db.emergency_alert_cooldowns.drop_index("device_id_1")
+        except OperationFailure as exc:
+            if not _is_index_not_found_error(exc):
+                # Anything other than "already gone" means the stale unique index may
+                # still be in place; fail startup loudly instead of silently running
+                # with it (which would cause false 429 "please wait" responses).
+                logger.error("Failed to drop legacy cooldown index device_id_1: %s", exc)
+                raise
+            # Index was already dropped (e.g. concurrently by another instance); ignore.
+
+    # Legacy cooldown documents created before PR #33 only have `device_id`, not
+    # `emergency_device_id`. A non-sparse unique index on `emergency_device_id` treats
+    # every missing value as null, so two or more such legacy rows collide and the
+    # create_index call below raises DuplicateKeyError, aborting startup. Cooldowns are
+    # short-lived (minutes), so it's safe to simply delete legacy rows that predate the
+    # new field; this also keeps the migration idempotent (no-op on later runs).
+    await db.emergency_alert_cooldowns.delete_many({"emergency_device_id": {"$exists": False}})
 
     # Unique index backing the atomic upsert used to guard the nearby-riders alert cooldown.
     await db.emergency_alert_cooldowns.create_index("emergency_device_id", unique=True)
@@ -1357,6 +1407,28 @@ async def create_indexes():
         {"emergency_device_id": {"$exists": False}},
         {"$unset": {"last_known_location": ""}},
     )
+
+    # TTL index so unauthenticated call-for-help rows (see call_for_help) and other
+    # emergency_alerts rows don't accumulate forever. EmergencyAlert.timestamp is a real
+    # datetime (required by TTL indexes). Guard against a pre-existing index of the same
+    # name with different options (e.g. a different retention window from an earlier
+    # deploy) so startup doesn't crash; drop and recreate it with the current options.
+    try:
+        await db.emergency_alerts.create_index(
+            "timestamp", name="timestamp_ttl", expireAfterSeconds=EMERGENCY_ALERT_RETENTION_SECONDS
+        )
+    except OperationFailure as exc:
+        conflict = (
+            getattr(exc, "code", None) == 85  # IndexOptionsConflict
+            or getattr(exc, "codeName", None) == "IndexOptionsConflict"
+            or "already exists with different options" in str(exc).lower()
+        )
+        if not conflict:
+            raise
+        await db.emergency_alerts.drop_index("timestamp_ttl")
+        await db.emergency_alerts.create_index(
+            "timestamp", name="timestamp_ttl", expireAfterSeconds=EMERGENCY_ALERT_RETENTION_SECONDS
+        )
 
 
 @app.on_event("shutdown")
