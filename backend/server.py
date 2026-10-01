@@ -1490,6 +1490,9 @@ async def create_indexes():
     await db.emergency_alert_cooldowns.delete_many({"emergency_device_id": {"$exists": False}})
 
     # Unique index backing the atomic upsert used to guard the nearby-riders alert cooldown.
+    await db.emergency_alert_cooldowns.delete_many(
+        {"emergency_device_id": {"$exists": False}}
+    )
     await db.emergency_alert_cooldowns.create_index("emergency_device_id", unique=True)
     # Unique (sparse) index backing the atomic $setOnInsert upsert used for emergency
     # device enrollment. Sparse so legacy rows that predate emergency_device_id (see the
