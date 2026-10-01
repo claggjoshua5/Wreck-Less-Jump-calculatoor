@@ -5,6 +5,7 @@ from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
+from mongomock_motor import AsyncMongoMockClient
 
 os.environ.setdefault("MONGO_URL", "mongodb://localhost:27017")
 os.environ.setdefault("DB_NAME", "wreckless_test")
@@ -61,6 +62,10 @@ class FakeCollection:
     def _matches(document, query):
         for key, expected in query.items():
             actual = document.get(key)
+            if isinstance(expected, dict) and "$exists" in expected:
+                if (key in document) != expected["$exists"]:
+                    return False
+                continue
             if isinstance(expected, dict) and "$ne" in expected:
                 if actual == expected["$ne"]:
                     return False
@@ -124,7 +129,7 @@ def test_emergency_endpoints_require_device_token(emergency_db, operation, token
     assert status == expected_status
 
 
-def test_first_settings_post_claims_token_once(emergency_db):
+def test_first_settings_post_uses_persisted_token_for_retries(emergency_db):
     db, _ = emergency_db
     db.emergency_settings.documents.clear()
 
@@ -132,22 +137,53 @@ def test_first_settings_post_claims_token_once(emergency_db):
         server.update_emergency_settings,
         "new-rider",
         server.EmergencySettingsUpdate(),
+        "stable-device-token",
     )
     assert status == 200
     first_body = first_response.model_dump(exclude_none=True)
-    token = first_body.pop("device_token")
-    assert len(token) > 32
-    assert db.emergency_settings.documents[0]["token_hash"] == hashlib.sha256(token.encode()).hexdigest()
-    assert token not in db.emergency_settings.documents[0].values()
+    assert "device_token" not in first_body
+    assert db.emergency_settings.documents[0]["token_hash"] == hashlib.sha256(
+        b"stable-device-token"
+    ).hexdigest()
 
     status, second_response = invoke(
         server.update_emergency_settings,
         "new-rider",
         server.EmergencySettingsUpdate(),
-        token,
+        "stable-device-token",
     )
     assert status == 200
     assert "device_token" not in second_response.model_dump(exclude_none=True)
+
+    status, _ = invoke(
+        server.update_emergency_settings,
+        "new-rider",
+        server.EmergencySettingsUpdate(),
+        "different-device-token",
+    )
+    assert status == 401
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_settings_posts_reuse_one_device_claim(monkeypatch):
+    mock_client = AsyncMongoMockClient()
+    mock_db = mock_client["emergency_enrollment_test"]
+    monkeypatch.setattr(server, "db", mock_db)
+    await server.create_indexes()
+
+    async def enroll():
+        return await server.update_emergency_settings(
+            "new-rider",
+            server.EmergencySettingsUpdate(),
+            "stable-device-token",
+        )
+
+    first, second = await asyncio.gather(enroll(), enroll())
+    stored = await mock_db.emergency_settings.find_one({"device_id": "new-rider"})
+
+    assert first.device_id == second.device_id == "new-rider"
+    assert stored["token_hash"] == hashlib.sha256(b"stable-device-token").hexdigest()
+    assert await mock_db.emergency_settings.count_documents({"device_id": "new-rider"}) == 1
 
 
 def test_settings_responses_never_expose_location_or_token_hash(emergency_db):

@@ -11,7 +11,6 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field
-import secrets
 from typing import List, Optional, Dict
 import uuid
 from datetime import datetime, timedelta
@@ -1053,13 +1052,20 @@ async def update_emergency_settings(
     """Update a device's emergency alert preferences."""
     normalized_device_id = require_device_id(device_id)
     existing = await db.emergency_settings.find_one({"device_id": normalized_device_id})
-    raw_device_token = None
     if existing and existing.get("token_hash"):
         await verify_device(normalized_device_id, device_token)
         token_hash = existing["token_hash"]
+        enrollment_query = {"device_id": normalized_device_id, "token_hash": token_hash}
+        upsert = False
     else:
-        raw_device_token = secrets.token_urlsafe(32)
-        token_hash = hashlib.sha256(raw_device_token.encode()).hexdigest()
+        if not device_token:
+            raise HTTPException(status_code=401, detail="Invalid or missing device token.")
+        token_hash = hashlib.sha256(device_token.encode()).hexdigest()
+        enrollment_query = {
+            "device_id": normalized_device_id,
+            "token_hash": {"$exists": False},
+        }
+        upsert = True
 
     settings = EmergencySettings(**existing) if existing else EmergencySettings(device_id=normalized_device_id)
 
@@ -1078,12 +1084,19 @@ async def update_emergency_settings(
 
     settings_data = settings.dict()
     settings_data["token_hash"] = token_hash
-    await db.emergency_settings.update_one(
-        {"device_id": normalized_device_id},
-        {"$set": settings_data},
-        upsert=True,
-    )
-    return to_public(settings, raw_device_token)
+    try:
+        await db.emergency_settings.update_one(
+            enrollment_query,
+            {"$set": settings_data},
+            upsert=upsert,
+        )
+    except DuplicateKeyError:
+        await verify_device(normalized_device_id, device_token)
+        await db.emergency_settings.update_one(
+            {"device_id": normalized_device_id, "token_hash": token_hash},
+            {"$set": settings_data},
+        )
+    return to_public(settings)
 
 
 @api_router.post("/emergency/call-for-help", response_model=CallForHelpResponse)
@@ -1246,6 +1259,7 @@ logger = logging.getLogger(__name__)
 async def create_indexes():
     # Unique index backing the atomic upsert used to guard the nearby-riders alert cooldown.
     await db.emergency_alert_cooldowns.create_index("device_id", unique=True)
+    await db.emergency_settings.create_index("device_id", unique=True)
 
 
 @app.on_event("shutdown")

@@ -164,13 +164,36 @@ async function getDeviceToken(): Promise<string | null> {
 
 async function setDeviceToken(token: string): Promise<void> {
   if (Platform.OS === 'web') {
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(DEVICE_TOKEN_STORAGE_KEY, token);
+    if (typeof localStorage === 'undefined') {
+      throw new Error('Secure storage is unavailable');
     }
+    localStorage.setItem(DEVICE_TOKEN_STORAGE_KEY, token);
     return;
   }
 
   await require('expo-secure-store').setItemAsync(DEVICE_TOKEN_STORAGE_KEY, token);
+}
+
+let deviceTokenPromise: Promise<string> | null = null;
+
+async function getOrCreateDeviceToken(): Promise<string> {
+  const existingToken = await getDeviceToken();
+  if (existingToken) {
+    return existingToken;
+  }
+
+  if (!deviceTokenPromise) {
+    deviceTokenPromise = (async () => {
+      const bytes = await require('expo-crypto').getRandomBytesAsync(32);
+      const token = Array.from(bytes, (byte: number) => byte.toString(16).padStart(2, '0')).join('');
+      await setDeviceToken(token);
+      return token;
+    })().finally(() => {
+      deviceTokenPromise = null;
+    });
+  }
+
+  return deviceTokenPromise;
 }
 
 async function getSavedCalculationsStorage(): Promise<SavedCalculation[]> {
@@ -558,7 +581,7 @@ async function fetchEmergencyJson<T>(
   init?: RequestInit
 ): Promise<T> {
   const makeRequest = async () => {
-    const token = await getDeviceToken();
+    const token = await getOrCreateDeviceToken();
     return fetchWithBackend(path, {
       ...init,
       headers: {
@@ -573,7 +596,7 @@ async function fetchEmergencyJson<T>(
     return parseEmergencyResponse<T>(response);
   }
 
-  const token = await getDeviceToken();
+  const token = await getOrCreateDeviceToken();
   const claimResponse = await fetchWithBackend(emergencySettingsPath(deviceId), {
     method: 'POST',
     headers: {
