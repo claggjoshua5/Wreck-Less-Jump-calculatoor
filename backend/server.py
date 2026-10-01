@@ -1413,10 +1413,9 @@ async def create_indexes():
     # datetime (required by TTL indexes). Guard against a pre-existing index of the same
     # name with different options (e.g. a different retention window from an earlier
     # deploy) so startup doesn't crash; drop and recreate it with the current options.
+    ttl_kwargs = {"name": "timestamp_ttl", "expireAfterSeconds": EMERGENCY_ALERT_RETENTION_SECONDS}
     try:
-        await db.emergency_alerts.create_index(
-            "timestamp", name="timestamp_ttl", expireAfterSeconds=EMERGENCY_ALERT_RETENTION_SECONDS
-        )
+        await db.emergency_alerts.create_index("timestamp", **ttl_kwargs)
     except OperationFailure as exc:
         conflict = (
             getattr(exc, "code", None) == 85  # IndexOptionsConflict
@@ -1426,9 +1425,15 @@ async def create_indexes():
         if not conflict:
             raise
         await db.emergency_alerts.drop_index("timestamp_ttl")
-        await db.emergency_alerts.create_index(
-            "timestamp", name="timestamp_ttl", expireAfterSeconds=EMERGENCY_ALERT_RETENTION_SECONDS
-        )
+        await db.emergency_alerts.create_index("timestamp", **ttl_kwargs)
+
+    # Backs the per-device write throttle in call_for_help (a find_one filtered on exactly
+    # these three fields, sorted by timestamp) so it doesn't degenerate into a collection
+    # scan as emergency_alerts grows between TTL expirations.
+    await db.emergency_alerts.create_index(
+        [("emergency_device_id", 1), ("alert_type", 1), ("timestamp", -1)],
+        name="emergency_device_id_1_alert_type_1_timestamp_-1",
+    )
 
 
 @app.on_event("shutdown")
