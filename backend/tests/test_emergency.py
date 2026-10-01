@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 from datetime import datetime, timedelta
 
+import pytest
 from httpx import ASGITransport, AsyncClient
 
 NYC = {"latitude": 40.7128, "longitude": -74.0060}
@@ -646,21 +647,34 @@ async def test_legacy_row_excluded_from_nearby_matching_and_location_purged(app,
 
 async def test_startup_drops_legacy_cooldown_index_and_allows_multiple_riders(app, db):
     # Simulate a pre-existing legacy unique index on `device_id` on emergency_alert_cooldowns
-    # (created in PR #29 before PR #33 switched keys to emergency_device_id).
+    # (created in PR #29 before PR #33 switched keys to emergency_device_id), plus real legacy
+    # cooldown documents that predate emergency_device_id. Against the old code, a non-sparse
+    # unique index on emergency_device_id would treat both rows' missing field as null and
+    # DuplicateKeyError here, aborting startup.
     import server as server_module
 
+    # The `app` fixture already ran create_indexes() once on an empty db, which created the
+    # emergency_device_id_1 unique index; drop it here to reproduce the pre-PR #33 state
+    # (only the legacy device_id_1 index, no emergency_device_id index yet) before inserting
+    # legacy rows that lack emergency_device_id.
+    await db.emergency_alert_cooldowns.drop_index("emergency_device_id_1")
     await db.emergency_alert_cooldowns.create_index(
         "device_id", unique=True, name="device_id_1"
+    )
+    await db.emergency_alert_cooldowns.insert_many(
+        [{"device_id": "old-rider-a"}, {"device_id": "old-rider-b"}]
     )
     initial_info = await db.emergency_alert_cooldowns.index_information()
     assert "device_id_1" in initial_info
 
-    # Run create_indexes() - it must drop device_id_1 safely and create emergency_device_id_1
+    # Run create_indexes() - it must drop device_id_1 and purge legacy rows safely, then
+    # create emergency_device_id_1, without raising DuplicateKeyError.
     await server_module.create_indexes()
 
     indexes_after = await db.emergency_alert_cooldowns.index_information()
     assert "device_id_1" not in indexes_after
     assert "emergency_device_id_1" in indexes_after
+    assert await db.emergency_alert_cooldowns.count_documents({}) == 0
 
     # Safe to run again (idempotent on subsequent restarts)
     await server_module.create_indexes()
@@ -698,6 +712,143 @@ async def test_startup_drops_legacy_cooldown_index_and_allows_multiple_riders(ap
             json={"emergency_device_id": rider_a, "location": NYC},
         )
         assert resp_a2.status_code == 429
+
+
+async def test_startup_tolerates_index_not_found_error_on_drop(app, db, monkeypatch):
+    """An index-not-found-style OperationFailure raised while dropping the legacy index
+    (e.g. a race where another instance already dropped it) must not abort startup."""
+    import server as server_module
+    from pymongo.errors import OperationFailure
+
+    await db.emergency_alert_cooldowns.create_index(
+        "device_id", unique=True, name="device_id_1"
+    )
+
+    collection_cls = type(db.emergency_alert_cooldowns)
+    real_drop_index = collection_cls.drop_index
+
+    async def fake_drop_index(self, name, *args, **kwargs):
+        if name == "device_id_1":
+            raise OperationFailure("index not found with name [device_id_1]", code=27)
+        return await real_drop_index(self, name, *args, **kwargs)
+
+    # Patch the collection class (not the instance) because mongomock-motor returns a
+    # fresh collection object on every `db.emergency_alert_cooldowns` access, so an
+    # instance-level monkeypatch would not be visible inside create_indexes().
+    monkeypatch.setattr(collection_cls, "drop_index", fake_drop_index)
+
+    # Must not raise, even though drop_index reports index-not-found.
+    await server_module.create_indexes()
+
+
+async def test_startup_raises_on_non_ignorable_drop_failure(app, db, monkeypatch):
+    """A non-"index not found" OperationFailure while dropping the legacy index (e.g. a
+    permissions problem) must abort startup loudly instead of leaving the stale unique
+    index in place, which would otherwise cause false 429 "please wait" responses."""
+    import server as server_module
+    from pymongo.errors import OperationFailure
+
+    await db.emergency_alert_cooldowns.create_index(
+        "device_id", unique=True, name="device_id_1"
+    )
+
+    async def fake_drop_index(self, name, *args, **kwargs):
+        raise OperationFailure("not authorized to drop index", code=13)
+
+    # See comment above: patch the collection class, not the instance.
+    monkeypatch.setattr(type(db.emergency_alert_cooldowns), "drop_index", fake_drop_index)
+
+    with pytest.raises(OperationFailure):
+        await server_module.create_indexes()
+
+
+# ---------------------------------------------------------------------------
+# Call-for-help throttle and retention
+# ---------------------------------------------------------------------------
+
+async def test_call_for_help_throttles_repeat_calls_same_device(app, db):
+    emergency_device_id = "emg-throttle-a"
+    other_device_id = "emg-throttle-b"
+
+    async with await client_for(app) as client:
+        resp1 = await client.post(
+            "/api/emergency/call-for-help",
+            json={"emergency_device_id": emergency_device_id, "location": NYC},
+        )
+        resp2 = await client.post(
+            "/api/emergency/call-for-help",
+            json={"emergency_device_id": emergency_device_id, "location": NYC},
+        )
+        resp_other = await client.post(
+            "/api/emergency/call-for-help",
+            json={"emergency_device_id": other_device_id, "location": NYC},
+        )
+
+    # Both repeat calls for the same device still return 200 success...
+    assert resp1.status_code == 200
+    assert resp2.status_code == 200
+    assert resp1.json()["success"] is True
+    assert resp2.json()["success"] is True
+    # ...but only one row was actually stored for that device within the throttle window.
+    assert resp2.json()["alert_id"] == resp1.json()["alert_id"]
+    count_same_device = await db.emergency_alerts.count_documents(
+        {"emergency_device_id": emergency_device_id, "alert_type": "call_for_help"}
+    )
+    assert count_same_device == 1
+
+    # A different device's call is stored independently.
+    assert resp_other.status_code == 200
+    count_other_device = await db.emergency_alerts.count_documents(
+        {"emergency_device_id": other_device_id, "alert_type": "call_for_help"}
+    )
+    assert count_other_device == 1
+
+
+async def test_call_for_help_logs_again_after_throttle_window_elapses(app, db):
+    emergency_device_id = "emg-throttle-elapsed"
+
+    async with await client_for(app) as client:
+        resp1 = await client.post(
+            "/api/emergency/call-for-help",
+            json={"emergency_device_id": emergency_device_id, "location": NYC},
+        )
+    assert resp1.status_code == 200
+
+    # Simulate the throttle window having elapsed by rewinding the stored row's timestamp.
+    await db.emergency_alerts.update_one(
+        {"id": resp1.json()["alert_id"]},
+        {"$set": {"timestamp": datetime.utcnow() - timedelta(seconds=60)}},
+    )
+
+    async with await client_for(app) as client:
+        resp2 = await client.post(
+            "/api/emergency/call-for-help",
+            json={"emergency_device_id": emergency_device_id, "location": NYC},
+        )
+    assert resp2.status_code == 200
+    assert resp2.json()["alert_id"] != resp1.json()["alert_id"]
+
+    count = await db.emergency_alerts.count_documents(
+        {"emergency_device_id": emergency_device_id, "alert_type": "call_for_help"}
+    )
+    assert count == 2
+
+
+async def test_emergency_alerts_has_ttl_index_on_timestamp(app, db):
+    """Verify the retention TTL index exists with the expected expireAfterSeconds. Note:
+    mongomock-motor stores TTL index metadata but does not actually expire documents in the
+    background, so this only checks the index definition, not real expiry behavior."""
+    import server as server_module
+
+    info = await db.emergency_alerts.index_information()
+    assert "timestamp_ttl" in info
+    assert info["timestamp_ttl"]["expireAfterSeconds"] == server_module.EMERGENCY_ALERT_RETENTION_SECONDS
+
+    # Idempotent: running create_indexes() again must not raise even though the index
+    # already exists with the same options.
+    await server_module.create_indexes()
+    info_again = await db.emergency_alerts.index_information()
+    assert info_again["timestamp_ttl"]["expireAfterSeconds"] == server_module.EMERGENCY_ALERT_RETENTION_SECONDS
 
 
 # ---------------------------------------------------------------------------
