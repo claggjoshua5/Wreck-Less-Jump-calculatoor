@@ -136,10 +136,57 @@ async def test_concurrent_enrollment_different_secrets_exactly_one_winner(app, d
 # Settings endpoint
 # ---------------------------------------------------------------------------
 
-async def test_get_settings_unauthenticated_unknown_device_returns_401(app):
+async def test_get_settings_unenrolled_device_returns_defaults_without_creating_doc(app, db):
+    emergency_device_id = "emg-first-time-rider"
+    secret = "secret-first-time-rider"
+
+    # First-time GET returns 200 with default settings and creates no record.
     async with await client_for(app) as client:
-        resp = await client.get("/api/emergency/settings/unknown-device")
-    assert resp.status_code == 401
+        resp = await client.get(f"/api/emergency/settings/{emergency_device_id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["allow_notifications"] is True
+        assert data["location_sharing_enabled"] is False
+        assert data["alert_cooldown_ms"] == 300000
+        assert data["has_location"] is False
+
+    doc = await db.emergency_settings.find_one({"emergency_device_id": emergency_device_id})
+    assert doc is None
+
+    # Subsequent POST with client secret enrolls successfully.
+    async with await client_for(app) as client:
+        enroll_resp = await client.post(
+            f"/api/emergency/settings/{emergency_device_id}",
+            headers={"X-Device-Token": secret},
+            json={"location_sharing_enabled": True},
+        )
+        assert enroll_resp.status_code == 200
+        assert enroll_resp.json()["location_sharing_enabled"] is True
+
+    # Later GETs require that secret.
+    async with await client_for(app) as client:
+        get_resp = await client.get(
+            f"/api/emergency/settings/{emergency_device_id}",
+            headers={"X-Device-Token": secret},
+        )
+        assert get_resp.status_code == 200
+        assert get_resp.json()["location_sharing_enabled"] is True
+
+
+async def test_get_settings_enrolled_device_wrong_or_missing_token_returns_401(app):
+    emergency_device_id = "emg-enrolled-token-check"
+    secret = "secret-enrolled-token-check"
+    await enable_sharing(app, emergency_device_id, secret)
+
+    async with await client_for(app) as client:
+        wrong_token_resp = await client.get(
+            f"/api/emergency/settings/{emergency_device_id}",
+            headers={"X-Device-Token": "wrong-secret"},
+        )
+        assert wrong_token_resp.status_code == 401
+
+        no_token_resp = await client.get(f"/api/emergency/settings/{emergency_device_id}")
+        assert no_token_resp.status_code == 401
 
 
 async def test_post_settings_sharing_off_clears_location(app):
@@ -229,9 +276,31 @@ async def test_call_for_help_returns_200_and_logs_alert(app, db):
     assert stored["alert_type"] == "call_for_help"
 
 
-async def test_call_for_help_requires_valid_token(app):
-    emergency_device_id = "emg-call-help-auth"
-    token = "token-call-help-auth"
+async def test_call_for_help_unenrolled_device_returns_200_logs_alert_with_no_location_creates_no_record(app, db):
+    emergency_device_id = "emg-call-help-unenrolled"
+
+    async with await client_for(app) as client:
+        resp = await client.post(
+            "/api/emergency/call-for-help",
+            json={"emergency_device_id": emergency_device_id, "location": NYC},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] is True
+
+    # Alert is recorded with location=None
+    stored = await db.emergency_alerts.find_one({"emergency_device_id": emergency_device_id})
+    assert stored is not None
+    assert stored["location"] is None
+
+    # No emergency_settings enrollment record created
+    settings_doc = await db.emergency_settings.find_one({"emergency_device_id": emergency_device_id})
+    assert settings_doc is None
+
+
+async def test_call_for_help_invalid_token_returns_200_logs_alert_with_no_location(app, db):
+    emergency_device_id = "emg-call-help-bad-token"
+    token = "token-call-help-good"
     await enable_sharing(app, emergency_device_id, token)
 
     async with await client_for(app) as client:
@@ -240,7 +309,13 @@ async def test_call_for_help_requires_valid_token(app):
             headers={"X-Device-Token": "wrong-token"},
             json={"emergency_device_id": emergency_device_id, "location": NYC},
         )
-    assert resp.status_code == 401
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] is True
+
+    stored = await db.emergency_alerts.find_one({"emergency_device_id": emergency_device_id})
+    assert stored is not None
+    assert stored["location"] is None
 
 
 async def test_call_for_help_stores_location_only_when_sharing_enabled(app, db):
@@ -464,20 +539,23 @@ async def test_general_device_id_cannot_authenticate_emergency_endpoints(app, db
         assert "emergency_device_id" not in shared_body
         assert real_emergency_id not in str(shared_body)
 
-        # Using the leaked general device_id as an emergency_device_id guess must not
-        # grant access to the rider's real emergency settings (a different, unrelated
-        # record — verified below by the 401).
+        # Using the leaked general device_id as an emergency_device_id guess returns
+        # only default public settings for an unenrolled ID, never the rider's real
+        # enrolled settings (which have location sharing on).
         auth_resp = await client.get(
             f"/api/emergency/settings/{general_device_id}",
             headers={"X-Device-Token": real_token},
         )
-        assert auth_resp.status_code == 401
+        assert auth_resp.status_code == 200
+        assert auth_resp.json()["location_sharing_enabled"] is False
+        assert auth_resp.json()["has_location"] is False
 
         auth_resp_real = await client.get(
             f"/api/emergency/settings/{real_emergency_id}",
             headers={"X-Device-Token": real_token},
         )
         assert auth_resp_real.status_code == 200
+        assert auth_resp_real.json()["location_sharing_enabled"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -497,14 +575,16 @@ async def test_legacy_row_cannot_be_claimed_via_old_device_id(app, db):
     )
 
     async with await client_for(app) as client:
-        # Any attacker (or the original rider) trying to authenticate against the legacy
-        # row's old device_id value must be rejected — it's never matched by emergency
-        # endpoints because they key exclusively on emergency_device_id.
+        # Any attacker (or the original rider) trying to query settings with the legacy
+        # row's old device_id value gets default unenrolled settings (has_location is False)
+        # rather than authenticated access to the legacy document (which has a location).
         get_resp = await client.get(
             f"/api/emergency/settings/{legacy_device_id}",
             headers={"X-Device-Token": "any-token"},
         )
-        assert get_resp.status_code == 401
+        assert get_resp.status_code == 200
+        assert get_resp.json()["has_location"] is False
+        assert get_resp.json()["location_sharing_enabled"] is False
 
         # A first "enrollment" attempt using that same string as emergency_device_id
         # creates a brand-new, independent record (proving the legacy row itself was never
@@ -562,6 +642,62 @@ async def test_legacy_row_excluded_from_nearby_matching_and_location_purged(app,
     # Only the sender itself is enrolled with emergency_device_id/token_hash; the legacy
     # row (no matter how close its stale location is) must never be counted.
     assert resp.json()["alerted_count"] == 0
+
+
+async def test_startup_drops_legacy_cooldown_index_and_allows_multiple_riders(app, db):
+    # Simulate a pre-existing legacy unique index on `device_id` on emergency_alert_cooldowns
+    # (created in PR #29 before PR #33 switched keys to emergency_device_id).
+    import server as server_module
+
+    await db.emergency_alert_cooldowns.create_index(
+        "device_id", unique=True, name="device_id_1"
+    )
+    initial_info = await db.emergency_alert_cooldowns.index_information()
+    assert "device_id_1" in initial_info
+
+    # Run create_indexes() - it must drop device_id_1 safely and create emergency_device_id_1
+    await server_module.create_indexes()
+
+    indexes_after = await db.emergency_alert_cooldowns.index_information()
+    assert "device_id_1" not in indexes_after
+    assert "emergency_device_id_1" in indexes_after
+
+    # Safe to run again (idempotent on subsequent restarts)
+    await server_module.create_indexes()
+
+    # Two DIFFERENT emergency devices can both send an alert without colliding on null device_id
+    rider_a = "emg-rider-cooldown-a"
+    token_a = "token-rider-cooldown-a"
+    rider_b = "emg-rider-cooldown-b"
+    token_b = "token-rider-cooldown-b"
+
+    await enable_sharing(app, rider_a, token_a)
+    await enable_sharing(app, rider_b, token_b)
+
+    async with await client_for(app) as client:
+        # Rider A sends alert -> 200
+        resp_a1 = await client.post(
+            "/api/emergency/alert-nearby-riders",
+            headers={"X-Device-Token": token_a},
+            json={"emergency_device_id": rider_a, "location": NYC},
+        )
+        assert resp_a1.status_code == 200
+
+        # Rider B sends alert -> 200 (if legacy device_id index remained, null collision would cause 429)
+        resp_b1 = await client.post(
+            "/api/emergency/alert-nearby-riders",
+            headers={"X-Device-Token": token_b},
+            json={"emergency_device_id": rider_b, "location": NYC},
+        )
+        assert resp_b1.status_code == 200
+
+        # Rider A sends another alert immediately within cooldown -> 429
+        resp_a2 = await client.post(
+            "/api/emergency/alert-nearby-riders",
+            headers={"X-Device-Token": token_a},
+            json={"emergency_device_id": rider_a, "location": NYC},
+        )
+        assert resp_a2.status_code == 429
 
 
 # ---------------------------------------------------------------------------

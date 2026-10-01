@@ -351,19 +351,17 @@ export default function Index() {
   const confirmCallForHelp = async () => {
     setShowCallHelpModal(false);
 
-    try {
-      const emergencyDeviceId = await getEmergencyDeviceId();
-      const location = currentLocation ?? (await loadCurrentLocation());
-      // Fire-and-forget log; never blocks or delays opening the dialer.
-      void logCallForHelp(emergencyDeviceId, location).catch((error) => {
-        Alert.alert(
-          'Emergency Logging Unavailable',
-          error.message || 'This device is not authorized to log the emergency request.'
-        );
-      });
-    } catch (error) {
-      console.log('Error logging call-for-help attempt:', error);
-    }
+    // Logging is strictly best-effort and silent: console.log only, never an Alert,
+    // and never awaited before opening the dialer so emergency calling is never delayed.
+    void (async () => {
+      try {
+        const emergencyDeviceId = await getEmergencyDeviceId();
+        const location = currentLocation ?? (await loadCurrentLocation());
+        await logCallForHelp(emergencyDeviceId, location);
+      } catch (error) {
+        console.log('Error logging call-for-help attempt:', error);
+      }
+    })();
 
     try {
       // This only opens the phone dialer pre-filled with 911 — the user must

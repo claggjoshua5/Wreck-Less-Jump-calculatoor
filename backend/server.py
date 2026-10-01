@@ -6,7 +6,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 import hashlib
 import hmac
 from pymongo import ReturnDocument
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import DuplicateKeyError, OperationFailure
 import os
 import logging
 from pathlib import Path
@@ -1090,8 +1090,30 @@ async def get_emergency_settings(
 ):
     """Get a device's emergency alert preferences (location sharing, notifications, cooldown)."""
     normalized_id = require_emergency_device_id(emergency_device_id)
-    settings = await verify_device(normalized_id, device_token)
-    return to_public(EmergencySettings(**settings))
+    doc = await db.emergency_settings.find_one(
+        {"emergency_device_id": normalized_id, "token_hash": {"$ne": None}}
+    )
+    # Tradeoff: unenrolled IDs return defaults without creating a record or requiring a token,
+    # while enrolled IDs require the matching token and return 401 on wrong/missing token.
+    # While this theoretically allows probing whether an ID is enrolled, emergency_device_id
+    # is a high-entropy, client-generated identifier that is never exposed to other users or
+    # returned by any API endpoint, making enumeration infeasible. Returning defaults allows
+    # first-time riders to view default settings before enrolling on their first settings update (POST).
+    if not doc:
+        return EmergencySettingsPublic(
+            allow_notifications=True,
+            location_sharing_enabled=False,
+            alert_cooldown_ms=DEFAULT_ALERT_COOLDOWN_MS,
+            has_location=False,
+        )
+
+    token_hash = doc.get("token_hash")
+    if not token_hash or not device_token or not hmac.compare_digest(
+        token_hash, hashlib.sha256(device_token.encode()).hexdigest()
+    ):
+        raise HTTPException(status_code=401, detail="Invalid or missing device token.")
+
+    return to_public(EmergencySettings(**doc))
 
 
 @api_router.post(
@@ -1143,12 +1165,27 @@ async def call_for_help(
 ):
     """Log an emergency call attempt. The app never auto-dials; this only records that
     the user confirmed the action and was routed to their phone's dialer with 911 pre-filled.
-    Location is only stored if the device has opted into location sharing."""
+    Location is only stored if the device is enrolled, authenticated, and has opted into
+    location sharing."""
     normalized_id = require_emergency_device_id(request.emergency_device_id)
-    settings_doc = await verify_device(normalized_id, device_token)
-    sharing_enabled = bool(settings_doc and settings_doc.get("location_sharing_enabled"))
+    settings_doc = await db.emergency_settings.find_one(
+        {"emergency_device_id": normalized_id, "token_hash": {"$ne": None}}
+    )
+    is_authenticated = False
+    if settings_doc and device_token:
+        token_hash = settings_doc.get("token_hash")
+        if token_hash and hmac.compare_digest(
+            token_hash, hashlib.sha256(device_token.encode()).hexdigest()
+        ):
+            is_authenticated = True
+
+    sharing_enabled = is_authenticated and bool(settings_doc and settings_doc.get("location_sharing_enabled"))
     stored_location = request.location if sharing_enabled else None
-    alert = EmergencyAlert(emergency_device_id=normalized_id, alert_type="call_for_help", location=stored_location)
+    alert = EmergencyAlert(
+        emergency_device_id=normalized_id,
+        alert_type="call_for_help",
+        location=stored_location,
+    )
     await db.emergency_alerts.insert_one(alert.dict())
     return CallForHelpResponse(
         success=True,
@@ -1289,6 +1326,21 @@ logger = logging.getLogger(__name__)
 
 @app.on_event("startup")
 async def create_indexes():
+    # Safely drop legacy unique index on device_id from PR #29 if present.
+    # New cooldown documents are keyed by emergency_device_id and omit device_id;
+    # a pre-existing unique index on device_id treats missing values as null and
+    # causes duplicate key errors (and false 429s) for subsequent riders.
+    try:
+        cooldown_indexes = await db.emergency_alert_cooldowns.index_information()
+        if "device_id_1" in cooldown_indexes:
+            try:
+                await db.emergency_alert_cooldowns.drop_index("device_id_1")
+            except OperationFailure:
+                # Ignore "index not found" if dropped concurrently or absent
+                pass
+    except Exception as exc:
+        logger.warning("Error checking or dropping legacy cooldown index: %s", exc)
+
     # Unique index backing the atomic upsert used to guard the nearby-riders alert cooldown.
     await db.emergency_alert_cooldowns.create_index("emergency_device_id", unique=True)
     # Unique (sparse) index backing the atomic $setOnInsert upsert used for emergency
