@@ -352,7 +352,7 @@ async def test_call_for_help_stores_location_only_when_sharing_enabled(app, db):
     assert stored_off["location"] is None
 
 
-async def test_call_for_help_enriches_and_preserves_location_within_throttle_window(app, db):
+async def test_call_for_help_location_is_enriched_and_preserved(app, db):
     unenrolled_device = "emg-help-enrich-after-anonymous"
     enrolled_device = "emg-help-preserve-after-anonymous"
     token = "token-help-location-order"
@@ -387,11 +387,20 @@ async def test_call_for_help_enriches_and_preserves_location_within_throttle_win
     ):
         assert response.status_code == 200
         assert response.json()["success"] is True
-    assert anonymous_first.json()["alert_id"] == authenticated_second.json()["alert_id"]
-    assert authenticated_first.json()["alert_id"] == anonymous_second.json()["alert_id"]
+    assert (
+        anonymous_first.json()["alert_id"]
+        == authenticated_second.json()["alert_id"]
+    )
+    assert (
+        authenticated_first.json()["alert_id"]
+        == anonymous_second.json()["alert_id"]
+    )
 
     enriched = await db.emergency_alerts.find_one(
-        {"emergency_device_id": unenrolled_device, "alert_type": "call_for_help"}
+        {
+            "emergency_device_id": unenrolled_device,
+            "alert_type": "call_for_help",
+        }
     )
     preserved = await db.emergency_alerts.find_one(
         {"emergency_device_id": enrolled_device, "alert_type": "call_for_help"}
@@ -861,7 +870,10 @@ async def test_call_for_help_concurrent_burst_creates_one_alert_row(app, db):
             *[
                 client.post(
                     "/api/emergency/call-for-help",
-                    json={"emergency_device_id": emergency_device_id, "location": NYC},
+                    json={
+                        "emergency_device_id": emergency_device_id,
+                        "location": NYC,
+                    },
                 )
                 for _ in range(24)
             ]
@@ -872,8 +884,8 @@ async def test_call_for_help_concurrent_burst_creates_one_alert_row(app, db):
     alert_ids = {response.json()["alert_id"] for response in responses}
     assert len(alert_ids) == 1
 
-    # mongomock-motor cannot fully reproduce real MongoDB race timing; this still exercises
-    # concurrent requests against the unique-keyed throttle path without weakening production.
+    # mongomock cannot reproduce MongoDB race timing; this tests the unique-state
+    # throttle concurrently.
     count = await db.emergency_alerts.count_documents(
         {
             "emergency_device_id": emergency_device_id,
@@ -894,9 +906,9 @@ async def test_call_for_help_logs_again_after_throttle_window_elapses(app, db):
         )
     assert resp1.status_code == 200
 
-    # Simulate the throttle window having elapsed by rewinding the stored row's timestamp.
-    await db.emergency_alerts.update_one(
-        {"id": resp1.json()["alert_id"]},
+    # Simulate the throttle window elapsing by rewinding the throttle state.
+    await db.emergency_call_throttles.update_one(
+        {"emergency_device_id": emergency_device_id},
         {"$set": {"timestamp": datetime.utcnow() - timedelta(seconds=60)}},
     )
 
@@ -931,7 +943,7 @@ async def test_emergency_alerts_has_ttl_index_on_timestamp(app, db):
     assert info_again["timestamp_ttl"]["expireAfterSeconds"] == server_module.EMERGENCY_ALERT_RETENTION_SECONDS
 
 
-async def test_persistent_ttl_index_conflict_does_not_drop_index_on_final_attempt(
+async def test_persistent_ttl_conflict_preserves_index_after_final_attempt(
     app, db, monkeypatch
 ):
     import server as server_module
@@ -949,7 +961,10 @@ async def test_persistent_ttl_index_conflict_does_not_drop_index_on_final_attemp
 
     async def conflicting_create_index(self, keys, *args, **kwargs):
         nonlocal attempts
-        if self.name == "emergency_alerts" and kwargs.get("name") == "timestamp_ttl":
+        if (
+            self.name == "emergency_alerts"
+            and kwargs.get("name") == "timestamp_ttl"
+        ):
             attempts += 1
             raise OperationFailure(
                 "index already exists with different options", code=85
@@ -961,14 +976,19 @@ async def test_persistent_ttl_index_conflict_does_not_drop_index_on_final_attemp
         if self.name == "emergency_alerts" and name == "timestamp_ttl":
             ttl_drops += 1
             if ttl_drops == 2:
-                # Simulate another instance restoring the old index during convergence.
+                # Simulate another instance restoring the old index.
                 await real_create_index(
-                    self, "timestamp", name="timestamp_ttl", expireAfterSeconds=60
+                    self,
+                    "timestamp",
+                    name="timestamp_ttl",
+                    expireAfterSeconds=60,
                 )
                 return None
         return await real_drop_index(self, name, *args, **kwargs)
 
-    monkeypatch.setattr(collection_cls, "create_index", conflicting_create_index)
+    monkeypatch.setattr(
+        collection_cls, "create_index", conflicting_create_index
+    )
     monkeypatch.setattr(collection_cls, "drop_index", keep_existing_ttl_index)
 
     await server_module.create_indexes()
@@ -979,7 +999,9 @@ async def test_persistent_ttl_index_conflict_does_not_drop_index_on_final_attemp
     assert info["timestamp_ttl"]["expireAfterSeconds"] == 60
 
 
-async def test_one_time_ttl_index_conflict_converges_to_new_retention(app, db, monkeypatch):
+async def test_one_time_ttl_conflict_converges_to_new_retention(
+    app, db, monkeypatch
+):
     import server as server_module
     from pymongo.errors import OperationFailure
 
@@ -993,7 +1015,10 @@ async def test_one_time_ttl_index_conflict_converges_to_new_retention(app, db, m
 
     async def conflict_once(self, keys, *args, **kwargs):
         nonlocal attempts
-        if self.name == "emergency_alerts" and kwargs.get("name") == "timestamp_ttl":
+        if (
+            self.name == "emergency_alerts"
+            and kwargs.get("name") == "timestamp_ttl"
+        ):
             attempts += 1
             if attempts == 1:
                 raise OperationFailure(
@@ -1023,10 +1048,13 @@ def test_operation_failure_matching_respects_codes_and_details():
     assert not server_module._is_index_not_found_error(
         OperationFailure("index not found", code=13)
     )
-    assert server_module._is_index_not_found_error(
-        OperationFailure("generic failure", details={"codeName": "IndexNotFound"})
+    details_error = OperationFailure(
+        "generic failure", details={"codeName": "IndexNotFound"}
     )
-    assert server_module._is_index_not_found_error(OperationFailure("index not found"))
+    assert server_module._is_index_not_found_error(details_error)
+    assert server_module._is_index_not_found_error(
+        OperationFailure("index not found")
+    )
 
 
 # ---------------------------------------------------------------------------

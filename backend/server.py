@@ -1215,7 +1215,7 @@ async def call_for_help(
     throttle_doc = None
     while throttle_doc is None:
         try:
-            await throttles.insert_one(throttle_state)
+            await throttles.insert_one(throttle_state.copy())
             throttle_doc = throttle_state
             create_alert = True
         except DuplicateKeyError:
