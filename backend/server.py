@@ -15,6 +15,8 @@ from typing import List, Optional, Dict
 import uuid
 from datetime import datetime, timedelta
 import math
+import asyncio
+import random
 
 # Load environment variables
 ROOT_DIR = Path(__file__).parent
@@ -1395,7 +1397,7 @@ async def _ensure_ttl_index(collection, field: str, name: str, expire_after_seco
     retention window is not safety-critical, so we log and move on rather than aborting
     startup if we can't converge it within a few attempts."""
     kwargs = {"name": name, "expireAfterSeconds": expire_after_seconds}
-    for _ in range(max_attempts):
+    for attempt in range(max_attempts):
         try:
             await collection.create_index(field, **kwargs)
             return
@@ -1407,8 +1409,11 @@ async def _ensure_ttl_index(collection, field: str, name: str, expire_after_seco
             except OperationFailure as drop_exc:
                 if not _is_index_not_found_error(drop_exc):
                     raise
-            # Dropped (or it was already gone); loop around to retry create_index.
-            continue
+            # Dropped (or it was already gone). A brief, jittered backoff before retrying
+            # reduces the chance that two instances racing to converge this index keep
+            # colliding with each other on every attempt.
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(random.uniform(0.05, 0.2))
     logger.warning(
         "Could not converge TTL index %r on %s to expireAfterSeconds=%s after %d attempt(s); "
         "leaving whatever index currently exists in place.",
