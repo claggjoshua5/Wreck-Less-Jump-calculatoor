@@ -1210,6 +1210,11 @@ async def call_for_help(
         location=stored_location,
         timestamp=now,
     )
+    # NOTE: this query/upsert has no unique index backing it (see comment above), so it is
+    # NOT a hard uniqueness guarantee like the nearby-riders cooldown -- under concurrency
+    # or with pre-existing rows, more than one document could match this filter at once.
+    # That's an accepted tradeoff here (TTL-cleaned duplicates are harmless), but a future
+    # change to this query must not assume exactly one row ever matches.
     stored_alert = await db.emergency_alerts.find_one_and_update(
         {
             "emergency_device_id": normalized_id,
@@ -1402,6 +1407,8 @@ async def _ensure_ttl_index(collection, field: str, name: str, expire_after_seco
             except OperationFailure as drop_exc:
                 if not _is_index_not_found_error(drop_exc):
                     raise
+            # Dropped (or it was already gone); loop around to retry create_index.
+            continue
     logger.warning(
         "Could not converge TTL index %r on %s to expireAfterSeconds=%s after %d attempt(s); "
         "leaving whatever index currently exists in place.",
