@@ -2,10 +2,14 @@ name: Android APK CI
 
 on:
   push:
-    branches: ["main", "master"]
+    branches: ["main", "master", "wreckless-final-product"]
   pull_request:
-    branches: ["main", "master"]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
+
+concurrency:
+  group: android-apk-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
