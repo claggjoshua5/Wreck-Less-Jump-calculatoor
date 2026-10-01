@@ -1193,33 +1193,34 @@ async def call_for_help(
     # This endpoint intentionally accepts unenrolled/unauthenticated callers (a rider in an
     # emergency must never be blocked), so it must stay cheap to spam. Throttle writes per
     # emergency_device_id instead of rejecting the request: if this ID already logged a
-    # call_for_help alert within CALL_FOR_HELP_THROTTLE_SECONDS, reuse that row's id and skip
-    # the insert, still returning the normal 200 response. A find_one-then-insert has a small
-    # race window under concurrency, but the worst case is a few extra duplicate rows during
-    # a burst, which the TTL index on `timestamp` (see create_indexes) still cleans up -- it
-    # is not a correctness issue worth a new unique index for. Real per-IP rate limiting would
-    # need infrastructure (reverse proxy / middleware) and is intentionally out of scope here.
+    # call_for_help alert within CALL_FOR_HELP_THROTTLE_SECONDS, reuse that row instead of
+    # inserting another one, still returning the normal 200 response. Implemented as a single
+    # atomic find_one_and_update upsert (same idea as the nearby-riders cooldown) rather than
+    # a separate find_one + insert_one, so there's no check-then-insert race window: either an
+    # existing in-window row is matched (no-op), or $setOnInsert creates exactly one new row.
+    # We deliberately don't add a new unique index for this (unlike the cooldown collection);
+    # worst case under unusual concurrency is one extra duplicate row, which the TTL index on
+    # `timestamp` (see create_indexes) still cleans up. Real per-IP rate limiting would need
+    # infrastructure (reverse proxy / middleware) and is intentionally out of scope here.
     now = datetime.utcnow()
     throttle_cutoff = now - timedelta(seconds=CALL_FOR_HELP_THROTTLE_SECONDS)
-    recent_alert = await db.emergency_alerts.find_one(
-        {
-            "emergency_device_id": normalized_id,
-            "alert_type": "call_for_help",
-            "timestamp": {"$gte": throttle_cutoff},
-        },
-        sort=[("timestamp", -1)],
-    )
-    if recent_alert:
-        return CallForHelpResponse(success=True, message=message, alert_id=recent_alert["id"])
-
-    alert = EmergencyAlert(
+    new_alert = EmergencyAlert(
         emergency_device_id=normalized_id,
         alert_type="call_for_help",
         location=stored_location,
         timestamp=now,
     )
-    await db.emergency_alerts.insert_one(alert.dict())
-    return CallForHelpResponse(success=True, message=message, alert_id=alert.id)
+    stored_alert = await db.emergency_alerts.find_one_and_update(
+        {
+            "emergency_device_id": normalized_id,
+            "alert_type": "call_for_help",
+            "timestamp": {"$gte": throttle_cutoff},
+        },
+        {"$setOnInsert": new_alert.dict()},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return CallForHelpResponse(success=True, message=message, alert_id=stored_alert["id"])
 
 
 @api_router.post("/emergency/alert-nearby-riders", response_model=AlertNearbyRidersResponse)
@@ -1352,16 +1353,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def _operation_failure_matches(exc: OperationFailure, code: int, code_name: str, message_substring: str) -> bool:
+    """True if `exc` matches a specific MongoDB failure identified by `code`/`codeName`.
+    mongomock-motor (used in tests) raises OperationFailure for the same situations but
+    often without a code/codeName, so fall back to sniffing `message_substring` in the
+    error text in that case."""
+    if getattr(exc, "code", None) == code:
+        return True
+    if getattr(exc, "codeName", None) == code_name:
+        return True
+    return message_substring in str(exc).lower()
+
+
 def _is_index_not_found_error(exc: OperationFailure) -> bool:
-    """True if `exc` represents MongoDB's "index not found" failure (code 27 /
-    codeName IndexNotFound), which is safe to ignore when dropping a legacy index.
-    mongomock-motor (used in tests) raises OperationFailure for the same situation but
-    without a code/codeName, so fall back to sniffing the message in that case."""
-    if getattr(exc, "code", None) == 27:
-        return True
-    if getattr(exc, "codeName", None) == "IndexNotFound":
-        return True
-    return "index not found" in str(exc).lower()
+    """True if `exc` represents MongoDB's "index not found" failure, which is safe to
+    ignore when dropping a legacy index."""
+    return _operation_failure_matches(exc, 27, "IndexNotFound", "index not found")
+
+
+def _is_index_options_conflict_error(exc: OperationFailure) -> bool:
+    """True if `exc` represents MongoDB's "index already exists with different options"
+    failure, e.g. when a TTL index's expireAfterSeconds changed between deploys."""
+    return _operation_failure_matches(exc, 85, "IndexOptionsConflict", "already exists with different options")
 
 
 @app.on_event("startup")
@@ -1417,12 +1430,7 @@ async def create_indexes():
     try:
         await db.emergency_alerts.create_index("timestamp", **ttl_kwargs)
     except OperationFailure as exc:
-        conflict = (
-            getattr(exc, "code", None) == 85  # IndexOptionsConflict
-            or getattr(exc, "codeName", None) == "IndexOptionsConflict"
-            or "already exists with different options" in str(exc).lower()
-        )
-        if not conflict:
+        if not _is_index_options_conflict_error(exc):
             raise
         await db.emergency_alerts.drop_index("timestamp_ttl")
         await db.emergency_alerts.create_index("timestamp", **ttl_kwargs)
