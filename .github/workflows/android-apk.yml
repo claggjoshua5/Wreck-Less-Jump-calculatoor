@@ -23,6 +23,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: yarn install
+
+      - name: Prebuild Android
+        working-directory: frontend
+        run: npx expo prebuild --platform android
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -90,6 +102,13 @@ jobs:
 
       - name: Build debug APK
         working-directory: frontend/android
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk
+          path: frontend/android/app/build/outputs/apk/debug/*.apk
         timeout-minutes: 45
         env:
           ANDROID_HOME: /usr/local/lib/android/sdk
