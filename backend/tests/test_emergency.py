@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 from datetime import datetime, timedelta
 
+import pytest
 from httpx import ASGITransport, AsyncClient
 
 NYC = {"latitude": 40.7128, "longitude": -74.0060}
@@ -136,10 +137,57 @@ async def test_concurrent_enrollment_different_secrets_exactly_one_winner(app, d
 # Settings endpoint
 # ---------------------------------------------------------------------------
 
-async def test_get_settings_unauthenticated_unknown_device_returns_401(app):
+async def test_get_settings_unenrolled_device_returns_defaults_without_creating_doc(app, db):
+    emergency_device_id = "emg-first-time-rider"
+    secret = "secret-first-time-rider"
+
+    # First-time GET returns 200 with default settings and creates no record.
     async with await client_for(app) as client:
-        resp = await client.get("/api/emergency/settings/unknown-device")
-    assert resp.status_code == 401
+        resp = await client.get(f"/api/emergency/settings/{emergency_device_id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["allow_notifications"] is True
+        assert data["location_sharing_enabled"] is False
+        assert data["alert_cooldown_ms"] == 300000
+        assert data["has_location"] is False
+
+    doc = await db.emergency_settings.find_one({"emergency_device_id": emergency_device_id})
+    assert doc is None
+
+    # Subsequent POST with client secret enrolls successfully.
+    async with await client_for(app) as client:
+        enroll_resp = await client.post(
+            f"/api/emergency/settings/{emergency_device_id}",
+            headers={"X-Device-Token": secret},
+            json={"location_sharing_enabled": True},
+        )
+        assert enroll_resp.status_code == 200
+        assert enroll_resp.json()["location_sharing_enabled"] is True
+
+    # Later GETs require that secret.
+    async with await client_for(app) as client:
+        get_resp = await client.get(
+            f"/api/emergency/settings/{emergency_device_id}",
+            headers={"X-Device-Token": secret},
+        )
+        assert get_resp.status_code == 200
+        assert get_resp.json()["location_sharing_enabled"] is True
+
+
+async def test_get_settings_enrolled_device_wrong_or_missing_token_returns_401(app):
+    emergency_device_id = "emg-enrolled-token-check"
+    secret = "secret-enrolled-token-check"
+    await enable_sharing(app, emergency_device_id, secret)
+
+    async with await client_for(app) as client:
+        wrong_token_resp = await client.get(
+            f"/api/emergency/settings/{emergency_device_id}",
+            headers={"X-Device-Token": "wrong-secret"},
+        )
+        assert wrong_token_resp.status_code == 401
+
+        no_token_resp = await client.get(f"/api/emergency/settings/{emergency_device_id}")
+        assert no_token_resp.status_code == 401
 
 
 async def test_post_settings_sharing_off_clears_location(app):
@@ -229,9 +277,31 @@ async def test_call_for_help_returns_200_and_logs_alert(app, db):
     assert stored["alert_type"] == "call_for_help"
 
 
-async def test_call_for_help_requires_valid_token(app):
-    emergency_device_id = "emg-call-help-auth"
-    token = "token-call-help-auth"
+async def test_call_for_help_unenrolled_device_returns_200_logs_alert_with_no_location_creates_no_record(app, db):
+    emergency_device_id = "emg-call-help-unenrolled"
+
+    async with await client_for(app) as client:
+        resp = await client.post(
+            "/api/emergency/call-for-help",
+            json={"emergency_device_id": emergency_device_id, "location": NYC},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] is True
+
+    # Alert is recorded with location=None
+    stored = await db.emergency_alerts.find_one({"emergency_device_id": emergency_device_id})
+    assert stored is not None
+    assert stored["location"] is None
+
+    # No emergency_settings enrollment record created
+    settings_doc = await db.emergency_settings.find_one({"emergency_device_id": emergency_device_id})
+    assert settings_doc is None
+
+
+async def test_call_for_help_invalid_token_returns_200_logs_alert_with_no_location(app, db):
+    emergency_device_id = "emg-call-help-bad-token"
+    token = "token-call-help-good"
     await enable_sharing(app, emergency_device_id, token)
 
     async with await client_for(app) as client:
@@ -240,7 +310,13 @@ async def test_call_for_help_requires_valid_token(app):
             headers={"X-Device-Token": "wrong-token"},
             json={"emergency_device_id": emergency_device_id, "location": NYC},
         )
-    assert resp.status_code == 401
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] is True
+
+    stored = await db.emergency_alerts.find_one({"emergency_device_id": emergency_device_id})
+    assert stored is not None
+    assert stored["location"] is None
 
 
 async def test_call_for_help_stores_location_only_when_sharing_enabled(app, db):
@@ -274,6 +350,64 @@ async def test_call_for_help_stores_location_only_when_sharing_enabled(app, db):
     stored_off = await db.emergency_alerts.find_one({"emergency_device_id": no_sharing_device})
     assert stored_on["location"] is not None
     assert stored_off["location"] is None
+
+
+async def test_call_for_help_location_is_enriched_and_preserved(app, db):
+    unenrolled_device = "emg-help-enrich-after-anonymous"
+    enrolled_device = "emg-help-preserve-after-anonymous"
+    token = "token-help-location-order"
+    await enable_sharing(app, unenrolled_device, token)
+    await enable_sharing(app, enrolled_device, token)
+
+    async with await client_for(app) as client:
+        anonymous_first = await client.post(
+            "/api/emergency/call-for-help",
+            json={"emergency_device_id": unenrolled_device, "location": NYC},
+        )
+        authenticated_second = await client.post(
+            "/api/emergency/call-for-help",
+            headers={"X-Device-Token": token},
+            json={"emergency_device_id": unenrolled_device, "location": NYC},
+        )
+        authenticated_first = await client.post(
+            "/api/emergency/call-for-help",
+            headers={"X-Device-Token": token},
+            json={"emergency_device_id": enrolled_device, "location": NYC},
+        )
+        anonymous_second = await client.post(
+            "/api/emergency/call-for-help",
+            json={"emergency_device_id": enrolled_device, "location": NYC},
+        )
+
+    for response in (
+        anonymous_first,
+        authenticated_second,
+        authenticated_first,
+        anonymous_second,
+    ):
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+    assert (
+        anonymous_first.json()["alert_id"]
+        == authenticated_second.json()["alert_id"]
+    )
+    assert (
+        authenticated_first.json()["alert_id"]
+        == anonymous_second.json()["alert_id"]
+    )
+
+    enriched = await db.emergency_alerts.find_one(
+        {
+            "emergency_device_id": unenrolled_device,
+            "alert_type": "call_for_help",
+        }
+    )
+    preserved = await db.emergency_alerts.find_one(
+        {"emergency_device_id": enrolled_device, "alert_type": "call_for_help"}
+    )
+    expected_location = {**NYC, "address": None}
+    assert enriched["location"] == expected_location
+    assert preserved["location"] == expected_location
 
 
 # ---------------------------------------------------------------------------
@@ -464,20 +598,23 @@ async def test_general_device_id_cannot_authenticate_emergency_endpoints(app, db
         assert "emergency_device_id" not in shared_body
         assert real_emergency_id not in str(shared_body)
 
-        # Using the leaked general device_id as an emergency_device_id guess must not
-        # grant access to the rider's real emergency settings (a different, unrelated
-        # record — verified below by the 401).
+        # Using the leaked general device_id as an emergency_device_id guess returns
+        # only default public settings for an unenrolled ID, never the rider's real
+        # enrolled settings (which have location sharing on).
         auth_resp = await client.get(
             f"/api/emergency/settings/{general_device_id}",
             headers={"X-Device-Token": real_token},
         )
-        assert auth_resp.status_code == 401
+        assert auth_resp.status_code == 200
+        assert auth_resp.json()["location_sharing_enabled"] is False
+        assert auth_resp.json()["has_location"] is False
 
         auth_resp_real = await client.get(
             f"/api/emergency/settings/{real_emergency_id}",
             headers={"X-Device-Token": real_token},
         )
         assert auth_resp_real.status_code == 200
+        assert auth_resp_real.json()["location_sharing_enabled"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -497,14 +634,16 @@ async def test_legacy_row_cannot_be_claimed_via_old_device_id(app, db):
     )
 
     async with await client_for(app) as client:
-        # Any attacker (or the original rider) trying to authenticate against the legacy
-        # row's old device_id value must be rejected — it's never matched by emergency
-        # endpoints because they key exclusively on emergency_device_id.
+        # Any attacker (or the original rider) trying to query settings with the legacy
+        # row's old device_id value gets default unenrolled settings (has_location is False)
+        # rather than authenticated access to the legacy document (which has a location).
         get_resp = await client.get(
             f"/api/emergency/settings/{legacy_device_id}",
             headers={"X-Device-Token": "any-token"},
         )
-        assert get_resp.status_code == 401
+        assert get_resp.status_code == 200
+        assert get_resp.json()["has_location"] is False
+        assert get_resp.json()["location_sharing_enabled"] is False
 
         # A first "enrollment" attempt using that same string as emergency_device_id
         # creates a brand-new, independent record (proving the legacy row itself was never
@@ -562,6 +701,360 @@ async def test_legacy_row_excluded_from_nearby_matching_and_location_purged(app,
     # Only the sender itself is enrolled with emergency_device_id/token_hash; the legacy
     # row (no matter how close its stale location is) must never be counted.
     assert resp.json()["alerted_count"] == 0
+
+
+async def test_startup_drops_legacy_cooldown_index_and_allows_multiple_riders(app, db):
+    # Simulate a pre-existing legacy unique index on `device_id` on emergency_alert_cooldowns
+    # (created in PR #29 before PR #33 switched keys to emergency_device_id), plus real legacy
+    # cooldown documents that predate emergency_device_id. Against the old code, a non-sparse
+    # unique index on emergency_device_id would treat both rows' missing field as null and
+    # DuplicateKeyError here, aborting startup.
+    import server as server_module
+
+    # The `app` fixture already ran create_indexes() once on an empty db, which created the
+    # emergency_device_id_1 unique index; drop it here to reproduce the pre-PR #33 state
+    # (only the legacy device_id_1 index, no emergency_device_id index yet) before inserting
+    # legacy rows that lack emergency_device_id.
+    await db.emergency_alert_cooldowns.drop_index("emergency_device_id_1")
+    await db.emergency_alert_cooldowns.create_index(
+        "device_id", unique=True, name="device_id_1"
+    )
+    await db.emergency_alert_cooldowns.insert_many(
+        [{"device_id": "old-rider-a"}, {"device_id": "old-rider-b"}]
+    )
+    initial_info = await db.emergency_alert_cooldowns.index_information()
+    assert "device_id_1" in initial_info
+
+    # Run create_indexes() - it must drop device_id_1 and purge legacy rows safely, then
+    # create emergency_device_id_1, without raising DuplicateKeyError.
+    await server_module.create_indexes()
+
+    indexes_after = await db.emergency_alert_cooldowns.index_information()
+    assert "device_id_1" not in indexes_after
+    assert "emergency_device_id_1" in indexes_after
+    assert await db.emergency_alert_cooldowns.count_documents({}) == 0
+
+    # Safe to run again (idempotent on subsequent restarts)
+    await server_module.create_indexes()
+
+    # Two DIFFERENT emergency devices can both send an alert without colliding on null device_id
+    rider_a = "emg-rider-cooldown-a"
+    token_a = "token-rider-cooldown-a"
+    rider_b = "emg-rider-cooldown-b"
+    token_b = "token-rider-cooldown-b"
+
+    await enable_sharing(app, rider_a, token_a)
+    await enable_sharing(app, rider_b, token_b)
+
+    async with await client_for(app) as client:
+        # Rider A sends alert -> 200
+        resp_a1 = await client.post(
+            "/api/emergency/alert-nearby-riders",
+            headers={"X-Device-Token": token_a},
+            json={"emergency_device_id": rider_a, "location": NYC},
+        )
+        assert resp_a1.status_code == 200
+
+        # Rider B sends alert -> 200 (if legacy device_id index remained, null collision would cause 429)
+        resp_b1 = await client.post(
+            "/api/emergency/alert-nearby-riders",
+            headers={"X-Device-Token": token_b},
+            json={"emergency_device_id": rider_b, "location": NYC},
+        )
+        assert resp_b1.status_code == 200
+
+        # Rider A sends another alert immediately within cooldown -> 429
+        resp_a2 = await client.post(
+            "/api/emergency/alert-nearby-riders",
+            headers={"X-Device-Token": token_a},
+            json={"emergency_device_id": rider_a, "location": NYC},
+        )
+        assert resp_a2.status_code == 429
+
+
+async def test_startup_tolerates_index_not_found_error_on_drop(app, db, monkeypatch):
+    """An index-not-found-style OperationFailure raised while dropping the legacy index
+    (e.g. a race where another instance already dropped it) must not abort startup."""
+    import server as server_module
+    from pymongo.errors import OperationFailure
+
+    await db.emergency_alert_cooldowns.create_index(
+        "device_id", unique=True, name="device_id_1"
+    )
+
+    collection_cls = type(db.emergency_alert_cooldowns)
+    real_drop_index = collection_cls.drop_index
+
+    async def fake_drop_index(self, name, *args, **kwargs):
+        if name == "device_id_1":
+            raise OperationFailure("index not found with name [device_id_1]", code=27)
+        return await real_drop_index(self, name, *args, **kwargs)
+
+    # Patch the collection class (not the instance) because mongomock-motor returns a
+    # fresh collection object on every `db.emergency_alert_cooldowns` access, so an
+    # instance-level monkeypatch would not be visible inside create_indexes().
+    monkeypatch.setattr(collection_cls, "drop_index", fake_drop_index)
+
+    # Must not raise, even though drop_index reports index-not-found.
+    await server_module.create_indexes()
+
+
+async def test_startup_raises_on_non_ignorable_drop_failure(app, db, monkeypatch):
+    """A non-"index not found" OperationFailure while dropping the legacy index (e.g. a
+    permissions problem) must abort startup loudly instead of leaving the stale unique
+    index in place, which would otherwise cause false 429 "please wait" responses."""
+    import server as server_module
+    from pymongo.errors import OperationFailure
+
+    await db.emergency_alert_cooldowns.create_index(
+        "device_id", unique=True, name="device_id_1"
+    )
+
+    async def fake_drop_index(self, name, *args, **kwargs):
+        raise OperationFailure("index not found despite another failure", code=13)
+
+    # See comment above: patch the collection class, not the instance.
+    monkeypatch.setattr(type(db.emergency_alert_cooldowns), "drop_index", fake_drop_index)
+
+    with pytest.raises(OperationFailure):
+        await server_module.create_indexes()
+
+
+# ---------------------------------------------------------------------------
+# Call-for-help throttle and retention
+# ---------------------------------------------------------------------------
+
+async def test_call_for_help_throttles_repeat_calls_same_device(app, db):
+    emergency_device_id = "emg-throttle-a"
+    other_device_id = "emg-throttle-b"
+
+    async with await client_for(app) as client:
+        resp1 = await client.post(
+            "/api/emergency/call-for-help",
+            json={"emergency_device_id": emergency_device_id, "location": NYC},
+        )
+        resp2 = await client.post(
+            "/api/emergency/call-for-help",
+            json={"emergency_device_id": emergency_device_id, "location": NYC},
+        )
+        resp_other = await client.post(
+            "/api/emergency/call-for-help",
+            json={"emergency_device_id": other_device_id, "location": NYC},
+        )
+
+    # Both repeat calls for the same device still return 200 success...
+    assert resp1.status_code == 200
+    assert resp2.status_code == 200
+    assert resp1.json()["success"] is True
+    assert resp2.json()["success"] is True
+    # ...but only one row was actually stored for that device within the throttle window.
+    assert resp2.json()["alert_id"] == resp1.json()["alert_id"]
+    count_same_device = await db.emergency_alerts.count_documents(
+        {"emergency_device_id": emergency_device_id, "alert_type": "call_for_help"}
+    )
+    assert count_same_device == 1
+
+    # A different device's call is stored independently.
+    assert resp_other.status_code == 200
+    count_other_device = await db.emergency_alerts.count_documents(
+        {"emergency_device_id": other_device_id, "alert_type": "call_for_help"}
+    )
+    assert count_other_device == 1
+
+
+async def test_call_for_help_concurrent_burst_creates_one_alert_row(app, db):
+    emergency_device_id = "emg-throttle-concurrent"
+
+    async with await client_for(app) as client:
+        responses = await asyncio.gather(
+            *[
+                client.post(
+                    "/api/emergency/call-for-help",
+                    json={
+                        "emergency_device_id": emergency_device_id,
+                        "location": NYC,
+                    },
+                )
+                for _ in range(24)
+            ]
+        )
+
+    assert all(response.status_code == 200 for response in responses)
+    assert all(response.json()["success"] is True for response in responses)
+    alert_ids = {response.json()["alert_id"] for response in responses}
+    assert len(alert_ids) == 1
+
+    # mongomock cannot reproduce MongoDB race timing; this tests the unique-state
+    # throttle concurrently.
+    count = await db.emergency_alerts.count_documents(
+        {
+            "emergency_device_id": emergency_device_id,
+            "alert_type": "call_for_help",
+            "timestamp": {"$gte": datetime.utcnow() - timedelta(seconds=10)},
+        }
+    )
+    assert count == 1
+
+
+async def test_call_for_help_logs_again_after_throttle_window_elapses(app, db):
+    emergency_device_id = "emg-throttle-elapsed"
+
+    async with await client_for(app) as client:
+        resp1 = await client.post(
+            "/api/emergency/call-for-help",
+            json={"emergency_device_id": emergency_device_id, "location": NYC},
+        )
+    assert resp1.status_code == 200
+
+    # Simulate the throttle window elapsing by rewinding the throttle state.
+    await db.emergency_call_throttles.update_one(
+        {"emergency_device_id": emergency_device_id},
+        {"$set": {"timestamp": datetime.utcnow() - timedelta(seconds=60)}},
+    )
+
+    async with await client_for(app) as client:
+        resp2 = await client.post(
+            "/api/emergency/call-for-help",
+            json={"emergency_device_id": emergency_device_id, "location": NYC},
+        )
+    assert resp2.status_code == 200
+    assert resp2.json()["alert_id"] != resp1.json()["alert_id"]
+
+    count = await db.emergency_alerts.count_documents(
+        {"emergency_device_id": emergency_device_id, "alert_type": "call_for_help"}
+    )
+    assert count == 2
+
+
+async def test_emergency_alerts_has_ttl_index_on_timestamp(app, db):
+    """Verify the retention TTL index exists with the expected expireAfterSeconds. Note:
+    mongomock-motor stores TTL index metadata but does not actually expire documents in the
+    background, so this only checks the index definition, not real expiry behavior."""
+    import server as server_module
+
+    info = await db.emergency_alerts.index_information()
+    assert "timestamp_ttl" in info
+    assert info["timestamp_ttl"]["expireAfterSeconds"] == server_module.EMERGENCY_ALERT_RETENTION_SECONDS
+
+    # Idempotent: running create_indexes() again must not raise even though the index
+    # already exists with the same options.
+    await server_module.create_indexes()
+    info_again = await db.emergency_alerts.index_information()
+    assert info_again["timestamp_ttl"]["expireAfterSeconds"] == server_module.EMERGENCY_ALERT_RETENTION_SECONDS
+
+
+async def test_persistent_ttl_conflict_preserves_index_after_final_attempt(
+    app, db, monkeypatch
+):
+    import server as server_module
+    from pymongo.errors import OperationFailure
+
+    await db.emergency_alerts.drop_index("timestamp_ttl")
+    await db.emergency_alerts.create_index(
+        "timestamp", name="timestamp_ttl", expireAfterSeconds=60
+    )
+    collection_cls = type(db.emergency_alerts)
+    real_create_index = collection_cls.create_index
+    real_drop_index = collection_cls.drop_index
+    attempts = 0
+    ttl_drops = 0
+
+    async def conflicting_create_index(self, keys, *args, **kwargs):
+        nonlocal attempts
+        if (
+            self.name == "emergency_alerts"
+            and kwargs.get("name") == "timestamp_ttl"
+        ):
+            attempts += 1
+            raise OperationFailure(
+                "index already exists with different options", code=85
+            )
+        return await real_create_index(self, keys, *args, **kwargs)
+
+    async def keep_existing_ttl_index(self, name, *args, **kwargs):
+        nonlocal ttl_drops
+        if self.name == "emergency_alerts" and name == "timestamp_ttl":
+            ttl_drops += 1
+            if ttl_drops == 2:
+                # Simulate another instance restoring the old index.
+                await real_create_index(
+                    self,
+                    "timestamp",
+                    name="timestamp_ttl",
+                    expireAfterSeconds=60,
+                )
+                return None
+        return await real_drop_index(self, name, *args, **kwargs)
+
+    monkeypatch.setattr(
+        collection_cls, "create_index", conflicting_create_index
+    )
+    monkeypatch.setattr(collection_cls, "drop_index", keep_existing_ttl_index)
+
+    await server_module.create_indexes()
+
+    assert attempts == 3
+    assert ttl_drops == 2
+    info = await db.emergency_alerts.index_information()
+    assert info["timestamp_ttl"]["expireAfterSeconds"] == 60
+
+
+async def test_one_time_ttl_conflict_converges_to_new_retention(
+    app, db, monkeypatch
+):
+    import server as server_module
+    from pymongo.errors import OperationFailure
+
+    await db.emergency_alerts.drop_index("timestamp_ttl")
+    await db.emergency_alerts.create_index(
+        "timestamp", name="timestamp_ttl", expireAfterSeconds=60
+    )
+    collection_cls = type(db.emergency_alerts)
+    real_create_index = collection_cls.create_index
+    attempts = 0
+
+    async def conflict_once(self, keys, *args, **kwargs):
+        nonlocal attempts
+        if (
+            self.name == "emergency_alerts"
+            and kwargs.get("name") == "timestamp_ttl"
+        ):
+            attempts += 1
+            if attempts == 1:
+                raise OperationFailure(
+                    "index already exists with different options", code=85
+                )
+        return await real_create_index(self, keys, *args, **kwargs)
+
+    monkeypatch.setattr(collection_cls, "create_index", conflict_once)
+
+    await server_module.create_indexes()
+
+    assert attempts == 2
+    info = await db.emergency_alerts.index_information()
+    assert (
+        info["timestamp_ttl"]["expireAfterSeconds"]
+        == server_module.EMERGENCY_ALERT_RETENTION_SECONDS
+    )
+
+
+def test_operation_failure_matching_respects_codes_and_details():
+    from pymongo.errors import OperationFailure
+    import server as server_module
+
+    assert server_module._is_index_not_found_error(
+        OperationFailure("index not found", code=27)
+    )
+    assert not server_module._is_index_not_found_error(
+        OperationFailure("index not found", code=13)
+    )
+    details_error = OperationFailure(
+        "generic failure", details={"codeName": "IndexNotFound"}
+    )
+    assert server_module._is_index_not_found_error(details_error)
+    assert server_module._is_index_not_found_error(
+        OperationFailure("index not found")
+    )
 
 
 # ---------------------------------------------------------------------------

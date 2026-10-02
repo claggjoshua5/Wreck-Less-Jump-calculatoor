@@ -760,9 +760,6 @@ export async function logCallForHelp(
     });
   } catch (error) {
     console.log('Failed to log call-for-help attempt:', error);
-    if (error instanceof DeviceAuthError) {
-      throw error;
-    }
   }
 }
 

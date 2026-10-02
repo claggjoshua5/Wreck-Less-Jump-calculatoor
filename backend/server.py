@@ -6,7 +6,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 import hashlib
 import hmac
 from pymongo import ReturnDocument
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import DuplicateKeyError, OperationFailure
 import os
 import logging
 from pathlib import Path
@@ -15,6 +15,8 @@ from typing import List, Optional, Dict
 import uuid
 from datetime import datetime, timedelta
 import math
+import asyncio
+import random
 
 # Load environment variables
 ROOT_DIR = Path(__file__).parent
@@ -175,6 +177,13 @@ class ShareCalculationRequest(BaseModel):
 # Emergency Alert Models
 DEFAULT_ALERT_COOLDOWN_MS = 5 * 60 * 1000  # 5 minutes
 NEARBY_RIDER_RADIUS_MILES = 5.0
+# Minimum time between two call-for-help rows logged for the same emergency_device_id.
+# This is a basic write throttle only (see call_for_help); real per-IP rate limiting
+# needs infrastructure (reverse proxy / middleware) and is out of scope here.
+CALL_FOR_HELP_THROTTLE_SECONDS = 10
+# Unauthenticated call-for-help rows must not accumulate forever; TTL-expire them from
+# emergency_alerts after this many seconds (30 days).
+EMERGENCY_ALERT_RETENTION_SECONDS = 30 * 24 * 60 * 60
 
 
 class EmergencySettings(BaseModel):
@@ -1090,8 +1099,30 @@ async def get_emergency_settings(
 ):
     """Get a device's emergency alert preferences (location sharing, notifications, cooldown)."""
     normalized_id = require_emergency_device_id(emergency_device_id)
-    settings = await verify_device(normalized_id, device_token)
-    return to_public(EmergencySettings(**settings))
+    doc = await db.emergency_settings.find_one(
+        {"emergency_device_id": normalized_id, "token_hash": {"$ne": None}}
+    )
+    # Tradeoff: unenrolled IDs return defaults without creating a record or requiring a token,
+    # while enrolled IDs require the matching token and return 401 on wrong/missing token.
+    # While this theoretically allows probing whether an ID is enrolled, emergency_device_id
+    # is a high-entropy, client-generated identifier that is never exposed to other users or
+    # returned by any API endpoint, making enumeration infeasible. Returning defaults allows
+    # first-time riders to view default settings before enrolling on their first settings update (POST).
+    if not doc:
+        return EmergencySettingsPublic(
+            allow_notifications=True,
+            location_sharing_enabled=False,
+            alert_cooldown_ms=DEFAULT_ALERT_COOLDOWN_MS,
+            has_location=False,
+        )
+
+    token_hash = doc.get("token_hash")
+    if not token_hash or not device_token or not hmac.compare_digest(
+        token_hash, hashlib.sha256(device_token.encode()).hexdigest()
+    ):
+        raise HTTPException(status_code=401, detail="Invalid or missing device token.")
+
+    return to_public(EmergencySettings(**doc))
 
 
 @api_router.post(
@@ -1143,18 +1174,98 @@ async def call_for_help(
 ):
     """Log an emergency call attempt. The app never auto-dials; this only records that
     the user confirmed the action and was routed to their phone's dialer with 911 pre-filled.
-    Location is only stored if the device has opted into location sharing."""
+    Location is only stored if the device is enrolled, authenticated, and has opted into
+    location sharing."""
     normalized_id = require_emergency_device_id(request.emergency_device_id)
-    settings_doc = await verify_device(normalized_id, device_token)
-    sharing_enabled = bool(settings_doc and settings_doc.get("location_sharing_enabled"))
-    stored_location = request.location if sharing_enabled else None
-    alert = EmergencyAlert(emergency_device_id=normalized_id, alert_type="call_for_help", location=stored_location)
-    await db.emergency_alerts.insert_one(alert.dict())
-    return CallForHelpResponse(
-        success=True,
-        message="Emergency call attempt logged. Always confirm the call in your phone's dialer.",
-        alert_id=alert.id,
+    settings_doc = await db.emergency_settings.find_one(
+        {"emergency_device_id": normalized_id, "token_hash": {"$ne": None}}
     )
+    is_authenticated = False
+    if settings_doc and device_token:
+        token_hash = settings_doc.get("token_hash")
+        if token_hash and hmac.compare_digest(
+            token_hash, hashlib.sha256(device_token.encode()).hexdigest()
+        ):
+            is_authenticated = True
+
+    sharing_enabled = is_authenticated and bool(settings_doc and settings_doc.get("location_sharing_enabled"))
+    stored_location = request.location if sharing_enabled else None
+    message = "Emergency call attempt logged. Always confirm the call in your phone's dialer."
+
+    # This endpoint intentionally accepts unenrolled/unauthenticated callers (a rider in an
+    # emergency must never be blocked). A uniquely keyed per-device throttle document bounds
+    # writes while every valid call still receives the normal success response.
+    now = datetime.utcnow()
+    throttle_cutoff = now - timedelta(seconds=CALL_FOR_HELP_THROTTLE_SECONDS)
+    new_alert = EmergencyAlert(
+        emergency_device_id=normalized_id,
+        alert_type="call_for_help",
+        location=stored_location,
+        timestamp=now,
+    )
+    location_data = stored_location.dict() if stored_location else None
+    throttles = db.emergency_call_throttles
+    throttle_state = {
+        "emergency_device_id": normalized_id,
+        "alert_id": new_alert.id,
+        "timestamp": now,
+        "location": location_data,
+    }
+    create_alert = False
+    throttle_doc = None
+    while throttle_doc is None:
+        try:
+            await throttles.insert_one(throttle_state.copy())
+            throttle_doc = throttle_state
+            create_alert = True
+        except DuplicateKeyError:
+            # Updating only an expired state makes this the sole request that starts a new
+            # window. Concurrent requests that lose this update reuse the winner's alert id.
+            throttle_doc = await throttles.find_one_and_update(
+                {
+                    "emergency_device_id": normalized_id,
+                    "timestamp": {"$lt": throttle_cutoff},
+                },
+                {"$set": throttle_state},
+                return_document=ReturnDocument.AFTER,
+            )
+            if throttle_doc:
+                create_alert = True
+            else:
+                if location_data:
+                    await throttles.update_one(
+                        {
+                            "emergency_device_id": normalized_id,
+                            "timestamp": {"$gte": throttle_cutoff},
+                        },
+                        {"$set": {"location": location_data}},
+                    )
+                throttle_doc = await throttles.find_one(
+                    {"emergency_device_id": normalized_id}
+                )
+
+    if create_alert:
+        await db.emergency_alerts.insert_one(new_alert.dict())
+
+    alert_id = throttle_doc["alert_id"]
+    if create_alert:
+        # An authenticated request may have enriched the throttle state before its
+        # corresponding alert row was inserted.
+        latest_state = await throttles.find_one(
+            {"emergency_device_id": normalized_id}
+        )
+        if latest_state and latest_state.get("location"):
+            await db.emergency_alerts.update_one(
+                {"id": alert_id},
+                {"$set": {"location": latest_state["location"]}},
+            )
+    elif location_data:
+        await db.emergency_alerts.update_one(
+            {"id": alert_id},
+            {"$set": {"location": location_data}},
+        )
+
+    return CallForHelpResponse(success=True, message=message, alert_id=alert_id)
 
 
 @api_router.post("/emergency/alert-nearby-riders", response_model=AlertNearbyRidersResponse)
@@ -1287,9 +1398,101 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def _operation_failure_matches(exc: OperationFailure, code: int, code_name: str, message_substring: str) -> bool:
+    """True if `exc` matches a specific MongoDB failure identified by `code`/`codeName`.
+    mongomock-motor (used in tests) raises OperationFailure for the same situations but
+    often without a code/codeName, so fall back to sniffing `message_substring` in the
+    error text in that case."""
+    error_code = getattr(exc, "code", None)
+    if error_code is not None:
+        return error_code == code
+
+    error_code_name = getattr(exc, "codeName", None)
+    details = getattr(exc, "details", None)
+    details_code_name = details.get("codeName") if isinstance(details, dict) else None
+    if error_code_name is not None or details_code_name is not None:
+        return code_name in (error_code_name, details_code_name)
+    return message_substring in str(exc).lower()
+
+
+def _is_index_not_found_error(exc: OperationFailure) -> bool:
+    """True if `exc` represents MongoDB's "index not found" failure, which is safe to
+    ignore when dropping a legacy index."""
+    return _operation_failure_matches(exc, 27, "IndexNotFound", "index not found")
+
+
+def _is_index_options_conflict_error(exc: OperationFailure) -> bool:
+    """True if `exc` represents MongoDB's "index already exists with different options"
+    failure, e.g. when a TTL index's expireAfterSeconds changed between deploys."""
+    return _operation_failure_matches(exc, 85, "IndexOptionsConflict", "already exists with different options")
+
+
+async def _ensure_ttl_index(collection, field: str, name: str, expire_after_seconds: int, max_attempts: int = 3):
+    """Idempotently create a TTL index, tolerating an existing index of the same name
+    with different options (e.g. a different retention window from an earlier deploy, or
+    another instance racing to apply the same migration concurrently) by dropping and
+    recreating it. Bounded retries instead of raising on conflict/race failures here:
+    unlike the legacy cooldown index (which must be gone for correctness), a TTL
+    retention window is not safety-critical, so we log and move on rather than aborting
+    startup if we can't converge it within a few attempts."""
+    kwargs = {"name": name, "expireAfterSeconds": expire_after_seconds}
+    for attempt in range(max_attempts):
+        try:
+            await collection.create_index(field, **kwargs)
+            return
+        except OperationFailure as exc:
+            if not _is_index_options_conflict_error(exc):
+                raise
+            if attempt < max_attempts - 1:
+                try:
+                    await collection.drop_index(name)
+                except OperationFailure as drop_exc:
+                    if not _is_index_not_found_error(drop_exc):
+                        raise
+                # Dropped (or it was already gone). A brief, jittered backoff before retrying
+                # reduces the chance that two instances racing to converge this index keep
+                # colliding with each other on every attempt.
+                await asyncio.sleep(random.uniform(0.05, 0.2))
+    logger.warning(
+        "Could not converge TTL index %r on %s to expireAfterSeconds=%s after %d attempt(s); "
+        "leaving whatever index currently exists in place.",
+        name, field, expire_after_seconds, max_attempts,
+    )
+
+
 @app.on_event("startup")
 async def create_indexes():
+    # Safely drop legacy unique index on device_id from PR #29 if present.
+    # New cooldown documents are keyed by emergency_device_id and omit device_id;
+    # a pre-existing unique index on device_id treats missing values as null and
+    # causes duplicate key errors (and false 429s) for subsequent riders.
+    cooldown_indexes = await db.emergency_alert_cooldowns.index_information()
+    if "device_id_1" in cooldown_indexes:
+        try:
+            await db.emergency_alert_cooldowns.drop_index("device_id_1")
+        except OperationFailure as exc:
+            if not _is_index_not_found_error(exc):
+                # Anything other than "already gone" means the stale unique index may
+                # still be in place; fail startup loudly instead of silently running
+                # with it (which would cause false 429 "please wait" responses).
+                logger.error("Failed to drop legacy cooldown index device_id_1: %s", exc)
+                raise
+            # Index was already dropped (e.g. concurrently by another instance); ignore.
+
+    # Legacy cooldown documents created before PR #33 only have `device_id`, not
+    # `emergency_device_id`. A non-sparse unique index on `emergency_device_id` treats
+    # every missing value as null, so two or more such legacy rows collide and the
+    # create_index call below raises DuplicateKeyError, aborting startup. Cooldowns are
+    # short-lived (minutes), so it's safe to simply delete legacy rows that predate the
+    # new field; this also keeps the migration idempotent (no-op on later runs). Run
+    # unconditionally (not gated on device_id_1 above) since legacy rows can exist even
+    # if that index was already dropped in an earlier deploy.
+    await db.emergency_alert_cooldowns.delete_many({"emergency_device_id": {"$exists": False}})
+
     # Unique index backing the atomic upsert used to guard the nearby-riders alert cooldown.
+    await db.emergency_alert_cooldowns.delete_many(
+        {"emergency_device_id": {"$exists": False}}
+    )
     await db.emergency_alert_cooldowns.create_index("emergency_device_id", unique=True)
     # Unique (sparse) index backing the atomic $setOnInsert upsert used for emergency
     # device enrollment. Sparse so legacy rows that predate emergency_device_id (see the
@@ -1304,6 +1507,26 @@ async def create_indexes():
     await db.emergency_settings.update_many(
         {"emergency_device_id": {"$exists": False}},
         {"$unset": {"last_known_location": ""}},
+    )
+
+    # TTL index so unauthenticated call-for-help rows (see call_for_help) and other
+    # emergency_alerts rows don't accumulate forever. EmergencyAlert.timestamp is a real
+    # datetime (required by TTL indexes). _ensure_ttl_index handles a pre-existing index
+    # of the same name with different options (e.g. a different retention window from an
+    # earlier deploy, or a concurrently-starting instance) without crashing startup.
+    await _ensure_ttl_index(
+        db.emergency_alerts, "timestamp", "timestamp_ttl", EMERGENCY_ALERT_RETENTION_SECONDS
+    )
+
+    # One state per device makes the call-for-help throttle safe under concurrent requests.
+    await db.emergency_call_throttles.create_index(
+        "emergency_device_id", unique=True, name="emergency_device_id_1"
+    )
+    await _ensure_ttl_index(
+        db.emergency_call_throttles,
+        "timestamp",
+        "timestamp_ttl",
+        EMERGENCY_ALERT_RETENTION_SECONDS,
     )
 
 
