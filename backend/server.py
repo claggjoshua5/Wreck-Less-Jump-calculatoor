@@ -11,7 +11,6 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field
-import secrets
 from typing import List, Optional, Dict
 import uuid
 from datetime import datetime, timedelta
@@ -179,7 +178,11 @@ NEARBY_RIDER_RADIUS_MILES = 5.0
 
 
 class EmergencySettings(BaseModel):
-    device_id: str
+    # emergency_device_id is a separate, high-entropy identifier generated on-device
+    # specifically for the emergency-alert feature. It is never returned by
+    # /api/shared/{share_code} or any other endpoint, unlike the general device_id used
+    # for saved calculations, so a share-code holder can never learn or claim it.
+    emergency_device_id: str
     allow_notifications: bool = True
     location_sharing_enabled: bool = False
     alert_cooldown_ms: int = DEFAULT_ALERT_COOLDOWN_MS
@@ -188,22 +191,18 @@ class EmergencySettings(BaseModel):
 
 
 class EmergencySettingsPublic(BaseModel):
-    device_id: str
     allow_notifications: bool
     location_sharing_enabled: bool
     alert_cooldown_ms: int
     has_location: bool
-    device_token: Optional[str] = None
 
 
-def to_public(settings: EmergencySettings, device_token: Optional[str] = None) -> EmergencySettingsPublic:
+def to_public(settings: EmergencySettings) -> EmergencySettingsPublic:
     return EmergencySettingsPublic(
-        device_id=settings.device_id,
         allow_notifications=settings.allow_notifications,
         location_sharing_enabled=settings.location_sharing_enabled,
         alert_cooldown_ms=settings.alert_cooldown_ms,
         has_location=settings.last_known_location is not None,
-        device_token=device_token,
     )
 
 
@@ -215,14 +214,14 @@ class EmergencySettingsUpdate(BaseModel):
 
 class EmergencyAlert(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    device_id: str
+    emergency_device_id: str
     alert_type: str  # "call_for_help" or "nearby_riders"
     location: Optional[LocationData] = None
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 
 class CallForHelpRequest(BaseModel):
-    device_id: str
+    emergency_device_id: str
     location: Optional[LocationData] = None
 
 
@@ -233,7 +232,7 @@ class CallForHelpResponse(BaseModel):
 
 
 class AlertNearbyRidersRequest(BaseModel):
-    device_id: str
+    emergency_device_id: str
     location: LocationData
 
 
@@ -338,11 +337,19 @@ def get_payment_webhook_base_url(http_request: Request) -> str:
     return str(http_request.base_url).rstrip("/")
 
 
+def require_nonblank_id(value: Optional[str], field_name: str) -> str:
+    normalized = (value or "").strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail=f"{field_name} is required")
+    return normalized
+
+
 def require_device_id(device_id: Optional[str]) -> str:
-    normalized_device_id = (device_id or "").strip()
-    if not normalized_device_id:
-        raise HTTPException(status_code=400, detail="device_id is required")
-    return normalized_device_id
+    return require_nonblank_id(device_id, "device_id")
+
+
+def require_emergency_device_id(emergency_device_id: Optional[str]) -> str:
+    return require_nonblank_id(emergency_device_id, "emergency_device_id")
 
 
 def haversine_distance_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -1007,61 +1014,104 @@ async def clear_calculation_history():
 # ==================== EMERGENCY ALERT ENDPOINTS ====================
 # NOTE: These endpoints never auto-dial or auto-broadcast on their own.
 # The frontend always requires an explicit, confirmed user action first.
+#
+# All auth here keys on emergency_device_id, a separate high-entropy identifier that is
+# never exposed by any endpoint (unlike the general device_id used for saved calculations,
+# which /api/shared/{share_code} does return). This prevents anyone who learns a rider's
+# general device_id from taking over that rider's emergency settings/token.
 
-@api_router.get(
-    "/emergency/settings/{device_id}",
-    response_model=EmergencySettingsPublic,
-    response_model_exclude_none=True,
-)
-async def get_emergency_settings(
-    device_id: str,
-    device_token: Optional[str] = Header(None, alias="X-Device-Token"),
-):
-    """Get a device's emergency alert preferences (location sharing, notifications, cooldown)."""
-@api_router.get("/emergency/settings/{device_id}", response_model=EmergencySettings)
-async def get_emergency_settings(device_id: str):
-    """Get a device's emergency alert preferences (location sharing, notifications, cooldown).
 
-    TODO(security): this endpoint has no authentication, so anyone who knows or guesses a
-    device_id can read that device's last_known_location. This needs a design decision
-    (auth / signed device token) before it can be considered safe; until then, either
-    protect this endpoint or stop returning last_known_location from it.
+async def verify_device(emergency_device_id: str, token: Optional[str]) -> Dict:
+    """Verify (but never create) an emergency device's credentials.
+
+    Only matches documents that already have both emergency_device_id and token_hash, so
+    legacy emergency_settings rows created before this identifier existed can never be
+    used for authentication, even if they happen to share a value with device_id.
     """
-    normalized_device_id = require_device_id(device_id)
-    settings = await verify_device(normalized_device_id, device_token)
-    return to_public(EmergencySettings(**settings))
-
-
-async def verify_device(device_id: str, token: Optional[str]) -> Dict:
-    settings = await db.emergency_settings.find_one({"device_id": device_id})
+    settings = await db.emergency_settings.find_one(
+        {"emergency_device_id": emergency_device_id, "token_hash": {"$ne": None}}
+    )
     token_hash = settings.get("token_hash") if settings else None
     if not token_hash or not token or not hmac.compare_digest(token_hash, hashlib.sha256(token.encode()).hexdigest()):
         raise HTTPException(status_code=401, detail="Invalid or missing device token.")
     return settings
 
 
-@api_router.post(
-    "/emergency/settings/{device_id}",
+async def enroll_or_verify(emergency_device_id: str, token: Optional[str]) -> Dict:
+    """Atomically enroll a brand-new emergency_device_id, or verify an existing one.
+
+    The client generates a high-entropy secret and persists it locally *before* sending
+    this request, so this is safe to retry: resending the same secret after a lost
+    response, timeout, or app restart always recovers the same claim. Enrollment is a
+    single upsert using $setOnInsert against the unique-indexed emergency_device_id field,
+    so concurrent first requests with the same secret all converge on one document, and
+    concurrent first requests with different secrets have exactly one winner.
+    """
+    if not token:
+        raise HTTPException(status_code=401, detail="Invalid or missing device token.")
+
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    now = datetime.utcnow()
+    try:
+        settings = await db.emergency_settings.find_one_and_update(
+            {"emergency_device_id": emergency_device_id},
+            {
+                "$setOnInsert": {
+                    "emergency_device_id": emergency_device_id,
+                    "token_hash": token_hash,
+                    "allow_notifications": True,
+                    "location_sharing_enabled": False,
+                    "alert_cooldown_ms": DEFAULT_ALERT_COOLDOWN_MS,
+                    "last_known_location": None,
+                    "updated_at": now,
+                }
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        # Lost the race to another concurrent first-enrollment request (real MongoDB can
+        # surface this from a racing upsert on a unique-indexed field); re-read whichever
+        # document won and verify against it below.
+        settings = await db.emergency_settings.find_one({"emergency_device_id": emergency_device_id})
+
+    if not settings or not hmac.compare_digest(settings.get("token_hash", ""), token_hash):
+        raise HTTPException(status_code=401, detail="Invalid or missing device token.")
+    return settings
+
+
+@api_router.get(
+    "/emergency/settings/{emergency_device_id}",
     response_model=EmergencySettingsPublic,
-    response_model_exclude_none=True,
+)
+async def get_emergency_settings(
+    emergency_device_id: str,
+    device_token: Optional[str] = Header(None, alias="X-Device-Token"),
+):
+    """Get a device's emergency alert preferences (location sharing, notifications, cooldown)."""
+    normalized_id = require_emergency_device_id(emergency_device_id)
+    settings = await verify_device(normalized_id, device_token)
+    return to_public(EmergencySettings(**settings))
+
+
+@api_router.post(
+    "/emergency/settings/{emergency_device_id}",
+    response_model=EmergencySettingsPublic,
 )
 async def update_emergency_settings(
-    device_id: str,
+    emergency_device_id: str,
     update: EmergencySettingsUpdate,
     device_token: Optional[str] = Header(None, alias="X-Device-Token"),
 ):
-    """Update a device's emergency alert preferences."""
-    normalized_device_id = require_device_id(device_id)
-    existing = await db.emergency_settings.find_one({"device_id": normalized_device_id})
-    raw_device_token = None
-    if existing and existing.get("token_hash"):
-        await verify_device(normalized_device_id, device_token)
-        token_hash = existing["token_hash"]
-    else:
-        raw_device_token = secrets.token_urlsafe(32)
-        token_hash = hashlib.sha256(raw_device_token.encode()).hexdigest()
+    """Enroll (idempotently) or update a device's emergency alert preferences.
 
-    settings = EmergencySettings(**existing) if existing else EmergencySettings(device_id=normalized_device_id)
+    The server never returns the raw device token; the client generated and persisted it
+    before making this request, so it already has it.
+    """
+    normalized_id = require_emergency_device_id(emergency_device_id)
+    existing = await enroll_or_verify(normalized_id, device_token)
+
+    settings = EmergencySettings(**existing)
 
     if update.allow_notifications is not None:
         settings.allow_notifications = update.allow_notifications
@@ -1077,13 +1127,13 @@ async def update_emergency_settings(
     settings.updated_at = datetime.utcnow()
 
     settings_data = settings.dict()
-    settings_data["token_hash"] = token_hash
+    settings_data["token_hash"] = existing["token_hash"]
     await db.emergency_settings.update_one(
-        {"device_id": normalized_device_id},
+        {"emergency_device_id": normalized_id},
         {"$set": settings_data},
         upsert=True,
     )
-    return to_public(settings, raw_device_token)
+    return to_public(settings)
 
 
 @api_router.post("/emergency/call-for-help", response_model=CallForHelpResponse)
@@ -1094,13 +1144,11 @@ async def call_for_help(
     """Log an emergency call attempt. The app never auto-dials; this only records that
     the user confirmed the action and was routed to their phone's dialer with 911 pre-filled.
     Location is only stored if the device has opted into location sharing."""
-    normalized_device_id = require_device_id(request.device_id)
-    await verify_device(normalized_device_id, device_token)
-    alert = EmergencyAlert(device_id=normalized_device_id, alert_type="call_for_help", location=request.location)
-    settings_doc = await db.emergency_settings.find_one({"device_id": normalized_device_id})
+    normalized_id = require_emergency_device_id(request.emergency_device_id)
+    settings_doc = await verify_device(normalized_id, device_token)
     sharing_enabled = bool(settings_doc and settings_doc.get("location_sharing_enabled"))
     stored_location = request.location if sharing_enabled else None
-    alert = EmergencyAlert(device_id=normalized_device_id, alert_type="call_for_help", location=stored_location)
+    alert = EmergencyAlert(emergency_device_id=normalized_id, alert_type="call_for_help", location=stored_location)
     await db.emergency_alerts.insert_one(alert.dict())
     return CallForHelpResponse(
         success=True,
@@ -1114,10 +1162,6 @@ async def alert_nearby_riders(
     request: AlertNearbyRidersRequest,
     device_token: Optional[str] = Header(None, alias="X-Device-Token"),
 ):
-    """Notify opted-in riders within 5 miles that help may be needed. Never broadcasts exact
-    location publicly; only used server-side to determine which devices are nearby. Enforces a
-    minimum cooldown between alerts from the same device to prevent spam."""
-async def alert_nearby_riders(request: AlertNearbyRidersRequest):
     """Log that a rider requested nearby help. Never broadcasts exact location publicly;
     only used server-side to count opted-in devices that are nearby. Enforces a minimum
     cooldown between alerts from the same device to prevent spam.
@@ -1125,10 +1169,8 @@ async def alert_nearby_riders(request: AlertNearbyRidersRequest):
     NOTE: this only counts nearby devices and logs an alert — there is no push notification
     or other delivery mechanism, so the response message must not claim riders were notified.
     """
-    normalized_device_id = require_device_id(request.device_id)
-    await verify_device(normalized_device_id, device_token)
-
-    settings_doc = await db.emergency_settings.find_one({"device_id": normalized_device_id})
+    normalized_id = require_emergency_device_id(request.emergency_device_id)
+    settings_doc = await verify_device(normalized_id, device_token)
 
     if not settings_doc or not settings_doc.get("location_sharing_enabled"):
         raise HTTPException(
@@ -1145,18 +1187,18 @@ async def alert_nearby_riders(request: AlertNearbyRidersRequest):
     try:
         await db.emergency_alert_cooldowns.find_one_and_update(
             {
-                "device_id": normalized_device_id,
+                "emergency_device_id": normalized_id,
                 "$or": [
                     {"last_alert_at": {"$exists": False}},
                     {"last_alert_at": {"$lte": cutoff}},
                 ],
             },
-            {"$set": {"device_id": normalized_device_id, "last_alert_at": now}},
+            {"$set": {"emergency_device_id": normalized_id, "last_alert_at": now}},
             upsert=True,
             return_document=ReturnDocument.AFTER,
         )
     except DuplicateKeyError:
-        existing = await db.emergency_alert_cooldowns.find_one({"device_id": normalized_device_id})
+        existing = await db.emergency_alert_cooldowns.find_one({"emergency_device_id": normalized_id})
         last_alert_at = existing["last_alert_at"] if existing else now
         if isinstance(last_alert_at, str):
             last_alert_at = datetime.fromisoformat(last_alert_at)
@@ -1167,16 +1209,19 @@ async def alert_nearby_riders(request: AlertNearbyRidersRequest):
             detail=f"Please wait {remaining_seconds} more second(s) before sending another alert.",
         )
 
-    alert = EmergencyAlert(device_id=normalized_device_id, alert_type="nearby_riders", location=request.location)
+    alert = EmergencyAlert(emergency_device_id=normalized_id, alert_type="nearby_riders", location=request.location)
     await db.emergency_alerts.insert_one(alert.dict())
 
     min_lat, max_lat, min_lon, max_lon = bounding_box(
         request.location.latitude, request.location.longitude, NEARBY_RIDER_RADIUS_MILES
     )
 
+    # Only rows with both emergency_device_id and token_hash are enrolled/claimable; this
+    # also excludes legacy rows (see startup cleanup) whose stored location may be stale.
     nearby_settings = await db.emergency_settings.find(
         {
-            "device_id": {"$ne": normalized_device_id},
+            "emergency_device_id": {"$exists": True, "$ne": normalized_id},
+            "token_hash": {"$exists": True, "$ne": None},
             "location_sharing_enabled": True,
             "allow_notifications": True,
             "last_known_location": {"$ne": None},
@@ -1245,7 +1290,21 @@ logger = logging.getLogger(__name__)
 @app.on_event("startup")
 async def create_indexes():
     # Unique index backing the atomic upsert used to guard the nearby-riders alert cooldown.
-    await db.emergency_alert_cooldowns.create_index("device_id", unique=True)
+    await db.emergency_alert_cooldowns.create_index("emergency_device_id", unique=True)
+    # Unique (sparse) index backing the atomic $setOnInsert upsert used for emergency
+    # device enrollment. Sparse so legacy rows that predate emergency_device_id (see the
+    # purge below) — which all lack the field — never collide under the uniqueness
+    # constraint.
+    await db.emergency_settings.create_index("emergency_device_id", unique=True, sparse=True)
+    # Legacy emergency_settings rows created before per-device auth have no
+    # emergency_device_id/token_hash and can never be claimed or authenticated against by
+    # the endpoints above (see verify_device/enroll_or_verify). Their last_known_location
+    # is therefore unreachable by its original owner and must not be used for nearby-rider
+    # matching, so purge it here. Idempotent and safe to run on every startup.
+    await db.emergency_settings.update_many(
+        {"emergency_device_id": {"$exists": False}},
+        {"$unset": {"last_known_location": ""}},
+    )
 
 
 @app.on_event("shutdown")
