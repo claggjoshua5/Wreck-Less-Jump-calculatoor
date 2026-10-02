@@ -1,28 +1,30 @@
 import React from 'react';
 import { Tabs, Redirect } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
-import { Platform, ActivityIndicator, View, Text, StyleSheet } from 'react-native';
+import { Platform, ActivityIndicator, View, Text, StyleSheet, type ColorValue } from 'react-native';
 import { useSubscription } from '../_layout';
 
 // Tab bar icon components defined outside of render
-const CalculatorIcon = ({ color, size }: { color: string; size: number }) => (
+type TabIconProps = { color: ColorValue; size: number };
+
+const CalculatorIcon = ({ color, size }: TabIconProps) => (
   <Ionicons name="calculator" size={size} color={color} />
 );
 
-const MeasureIcon = ({ color, size }: { color: string; size: number }) => (
+const MeasureIcon = ({ color, size }: TabIconProps) => (
   <Ionicons name="camera" size={size} color={color} />
 );
 
-const SavedIcon = ({ color, size }: { color: string; size: number }) => (
+const SavedIcon = ({ color, size }: TabIconProps) => (
   <Ionicons name="bookmark" size={size} color={color} />
 );
 
-const MapIcon = ({ color, size }: { color: string; size: number }) => (
+const MapIcon = ({ color, size }: TabIconProps) => (
   <Ionicons name="map" size={size} color={color} />
 );
 
 export default function TabLayout() {
-  const { isSubscribed, isLoading, isTrial, trialInfo, statusMessage } = useSubscription();
+  const { isSubscribed, isLoading, isTrial, trialInfo } = useSubscription();
 
   // Show loading while checking subscription
   if (isLoading) {
@@ -51,8 +53,10 @@ export default function TabLayout() {
       )}
       
       <Tabs
+        initialRouteName="index"
         screenOptions={{
           headerShown: false,
+          lazy: true,
           tabBarStyle: {
             backgroundColor: '#1A1A1A',
             borderTopColor: '#333',

@@ -10,8 +10,7 @@ import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
 import { useLocalSearchParams, router } from 'expo-router';
 import { useSubscription } from './_layout';
-
-const EXPO_PUBLIC_BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL;
+import { BACKEND_URL, isPaywallEnabled } from '@/lib/appSupport';
 
 export default function PaymentSuccessScreen() {
   const { session_id } = useLocalSearchParams();
@@ -28,6 +27,12 @@ export default function PaymentSuccessScreen() {
       }
 
       try {
+        if (!isPaywallEnabled || !BACKEND_URL) {
+          setSubscribed(true);
+          router.replace('/(tabs)');
+          return;
+        }
+
         // Poll for payment status
         let attempts = 0;
         const maxAttempts = 10;
@@ -35,7 +40,7 @@ export default function PaymentSuccessScreen() {
 
         const poll = async () => {
           attempts++;
-          const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/payments/status/${session_id}`);
+          const response = await fetch(`${BACKEND_URL}/api/payments/status/${session_id}`);
           
           if (!response.ok) {
             throw new Error('Failed to verify payment');
@@ -47,6 +52,7 @@ export default function PaymentSuccessScreen() {
             setStatus('success');
             setMessage('Payment successful! Enjoy the app.');
             setSubscribed(true);
+            await checkSubscription();
             
             // Redirect to main app after delay
             setTimeout(() => {
@@ -77,7 +83,7 @@ export default function PaymentSuccessScreen() {
     };
 
     verifyPayment();
-  }, [session_id]);
+  }, [checkSubscription, session_id, setSubscribed]);
 
   return (
     <SafeAreaView style={styles.container}>

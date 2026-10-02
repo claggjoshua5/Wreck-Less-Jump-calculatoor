@@ -2,17 +2,21 @@ name: Android APK CI
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: ["main", "master", "wreckless-final-product"]
   pull_request:
-    branches: [ "main", "master" ]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
+
+concurrency:
+  group: android-apk-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  build-apk:
-    name: Build Debug APK
+  build-android:
+    name: Build Android APKs
     runs-on: ubuntu-latest
 
     steps:
@@ -31,13 +35,66 @@ jobs:
       - name: Prebuild Android
         working-directory: frontend
         run: npx expo prebuild --platform android
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-          cache: gradle
+          # NOTE: do not set `cache: gradle` here. This step runs before
+          # `expo prebuild` generates `frontend/android`, so there are no
+          # Gradle files yet for setup-java to hash. When no files match,
+          # setup-java's built-in Gradle cache restore fails the step
+          # outright (see "No file ... matched" in the job log), which
+          # then causes every later step, including the prebuild itself,
+          # to be skipped. Gradle caching is handled separately below,
+          # after the Android project actually exists.
+
+      - name: Free runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/share/swift /usr/local/.ghcup /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Prebuild Android
+        working-directory: frontend
+        run: CI=1 npx expo prebuild --platform android --no-install
+
+      - name: Verify Android project was generated
+        run: |
+          if [ ! -f "frontend/android/gradlew" ]; then
+            echo "::error::expo prebuild did not generate frontend/android/gradlew. The Android project was not created, so the build cannot continue." >&2
+            exit 1
+          fi
+          if [ ! -f "frontend/android/app/build.gradle" ]; then
+            echo "::error::frontend/android/app/build.gradle is missing after prebuild. The generated Android project looks incomplete." >&2
+            exit 1
+          fi
+
+      - name: Cache Gradle native outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            frontend/android/.gradle
+            frontend/android/app/.cxx
+            frontend/android/app/build/intermediates/cmake
+            frontend/android/app/build/intermediates/cxx
+          key: ${{ runner.os }}-android-${{ hashFiles('frontend/package-lock.json', 'frontend/android/build.gradle', 'frontend/android/app/build.gradle', 'frontend/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-android-
 
       - name: Ensure gradlew is executable
         working-directory: frontend/android
@@ -52,4 +109,88 @@ jobs:
         with:
           name: debug-apk
           path: frontend/android/app/build/outputs/apk/debug/*.apk
+        timeout-minutes: 45
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          GRADLE_OPTS: -Dorg.gradle.jvmargs="-Xmx3072m -XX:MaxMetaspaceSize=512m -XX:+UseG1GC" -Dorg.gradle.daemon=false
+        run: |
+          ./gradlew assembleDebug \
+            --stacktrace \
+            --build-cache \
+            -x test \
+            -x lint \
+            --no-watch-fs \
+            -Dorg.gradle.parallel=true \
+            -Dorg.gradle.workers.max=4 \
+            -Dorg.gradle.caching=true \
+            -Dkotlin.compiler.execution.strategy=in-process
+
+      - name: Build release APK
+        working-directory: frontend/android
+        timeout-minutes: 45
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          GRADLE_OPTS: -Dorg.gradle.jvmargs="-Xmx3072m -XX:MaxMetaspaceSize=512m -XX:+UseG1GC" -Dorg.gradle.daemon=false
+        run: |
+          ./gradlew assembleRelease \
+            --stacktrace \
+            --build-cache \
+            -x test \
+            -x lint \
+            --no-watch-fs \
+            -Dorg.gradle.parallel=true \
+            -Dorg.gradle.workers.max=4 \
+            -Dorg.gradle.caching=true \
+            -Dkotlin.compiler.execution.strategy=in-process
+
+      - name: Verify APK outputs are valid
+        if: always()
+        run: |
+          set -e
+          if [ ! -d "frontend/android" ]; then
+            echo "::error::frontend/android does not exist, so no APKs could have been built. Check the earlier prebuild/verification steps for the real failure." >&2
+            exit 1
+          fi
+
+          echo "Searching for APK outputs under frontend/android..."
+          mapfile -t apks < <(find frontend/android -name "*.apk" -type f)
+
+          if [ "${#apks[@]}" -eq 0 ]; then
+            echo "::error::No APK files were produced under frontend/android/app/build/outputs/apk. The build did not complete successfully." >&2
+            exit 1
+          fi
+
+          for apk in "${apks[@]}"; do
+            size=$(stat -c%s "$apk")
+            echo "Found APK: $apk ($size bytes)"
+
+            if [ "$size" -eq 0 ]; then
+              echo "::error::$apk is empty (0 bytes). This is not a valid, installable APK." >&2
+              exit 1
+            fi
+
+            # A real APK is a ZIP archive containing AndroidManifest.xml.
+            # `unzip -l` fails if the file isn't a valid ZIP, and grep
+            # fails if the required entry is missing, so both catch
+            # corrupt/incomplete artifacts before they get uploaded.
+            if ! unzip -l "$apk" | grep -q "AndroidManifest.xml"; then
+              echo "::error::$apk does not look like a valid Android package (missing AndroidManifest.xml)." >&2
+              exit 1
+            fi
+          done
+
+          echo "All APK outputs look valid."
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: wreckless-jump-calculator-debug-apk
+          path: frontend/android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: wreckless-jump-calculator-release-apk
+          path: frontend/android/app/build/outputs/apk/release/*.apk
           if-no-files-found: error

@@ -204,15 +204,30 @@ frontend:
 
   - task: "Tab Navigation"
     implemented: true
-    working: true
+    working: false
     file: "/app/frontend/app/_layout.tsx"
-    stuck_count: 0
+    stuck_count: 2
     priority: "medium"
-    needs_retesting: false
+    needs_retesting: true
     status_history:
       - working: true
         agent: "main"
         comment: "Bottom tab navigation with Calculator, Saved, and Map tabs. Icons and styling working correctly."
+      - working: false
+        agent: "user"
+        comment: "User reported the Android app is stuck on the first screen after opening the downloaded app."
+      - working: false
+        agent: "main"
+        comment: "Reworked startup to bypass missing/unreachable backend checks, moved calculator/save/map flows to offline-safe fallbacks, and delayed the first location permission request until save time. Local validation passed with `npm run lint`, `npx tsc --noEmit`, and `npx expo export --platform android`; native Gradle APK build was blocked by sandbox DNS access to dl.google.com."
+      - working: false
+        agent: "user"
+        comment: "User reported that the freshly downloaded Android APK still gets stuck on the first screen."
+      - working: false
+        agent: "main"
+        comment: "Applied a second startup mitigation: removed startup-time splash/subscription blocking and deferred the Viro AR module load until the Measure screen explicitly enters AR mode, because startup-time native AR initialization remained a likely Android release blocker."
+      - working: false
+        agent: "main"
+        comment: "Brought the previously isolated Expo Router root redirect into the active Android build branch by adding `frontend/app/index.tsx` so the app root route resolves directly into `/(tabs)` instead of relying on an implicit startup path."
 
 metadata:
   created_by: "main_agent"
@@ -222,11 +237,14 @@ metadata:
 
 test_plan:
   current_focus:
-    - "All features working"
-  stuck_tasks: []
+    - "Android first-screen startup hang"
+  stuck_tasks:
+    - "Tab Navigation"
   test_all: false
   test_priority: "high_first"
 
 agent_communication:
   - agent: "main"
     message: "Enhanced features complete - Trajectory animation, save/share calculations with share codes, and map view for saved locations with interactive SVG visualization."
+  - agent: "main"
+    message: "User still reports the Android APK hanging on the first screen after install; startup was simplified further and AR native module loading was deferred for retest."

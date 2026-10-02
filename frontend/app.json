@@ -1,57 +1,42 @@
 {
   "expo": {
-    "name": "Wreck-Less Jump Calculator",
-    "slug": "wreck-less-jump-calculator",
+    "name": "Wreck-Less",
+    "slug": "wreck-less-jump-calculatoor",
     "version": "1.0.0",
-    "orientation": "portrait",
-    "icon": "./assets/images/icon-1024.png",
     "scheme": "wreckless",
-    "userInterfaceStyle": "automatic",
-    "newArchEnabled": true,
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "userInterfaceStyle": "dark",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.joshandheather.wrecklessjumpcalculator",
-      "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "Tag your jump locations on the map",
-        "NSCameraUsageDescription": "Take photos to measure ramp dimensions"
-      }
+      "bundleIdentifier": "com.joshandheather.wrecklessjumpcalculator"
     },
     "android": {
-      "package": "com.joshandheather.wrecklessjumpcalculator",
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/adaptive-icon.png",
-        "backgroundColor": "#000000"
+        "backgroundColor": "#121212"
       },
-      "edgeToEdgeEnabled": true,
+      "package": "com.joshandheather.wrecklessjumpcalculator",
       "permissions": [
         "ACCESS_FINE_LOCATION",
         "ACCESS_COARSE_LOCATION",
-        "CAMERA"
+        "WAKE_LOCK"
       ]
     },
-    "web": {
-      "bundler": "metro",
-      "output": "static",
-      "favicon": "./assets/images/favicon.png"
-    },
     "plugins": [
+      [
+        "./plugins/withAbiFilters",
+        {
+          "abiFilters": [
+            "arm64-v8a"
+          ]
+        }
+      ],
       "expo-router",
       [
         "expo-location",
         {
-          "locationAlwaysAndWhenInUsePermission": "Tag your jump locations on the map"
-        }
-      ],
-      [
-        "expo-camera",
-        {
-          "cameraPermission": "Take photos to measure ramp dimensions"
-        }
-      ],
-      [
-        "expo-image-picker",
-        {
-          "cameraPermission": "Take photos to measure ramp dimensions"
+          "locationWhenInUsePermission": "Allow Wreck-Less to use your location while using the app."
         }
       ],
       [
@@ -60,14 +45,13 @@
           "image": "./assets/images/splash-image.png",
           "imageWidth": 200,
           "resizeMode": "contain",
-          "backgroundColor": "#000"
+          "backgroundColor": "#121212"
         }
       ],
       "expo-web-browser",
-      "@reactvision/react-viro"
-    ],
-    "experiments": {
-      "typedRoutes": true
-    }
+      "expo-font",
+      "expo-image",
+      "expo-status-bar"
+    ]
   }
 }

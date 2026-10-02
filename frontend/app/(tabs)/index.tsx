@@ -14,53 +14,33 @@ import {
   Modal,
   Share,
   Image,
+  Linking,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
 import Svg, { Path, Circle, Line, Text as SvgText, G, Polygon } from 'react-native-svg';
 import * as Location from 'expo-location';
+import {
+  calculateJumpLocally,
+  CalculationResult,
+  fetchJsonWithBackend,
+  getDeviceId,
+  getEmergencyDeviceId,
+  getEmergencySettings,
+  getLastNearbyAlertSentAt,
+  getRemainingAlertCooldownMs,
+  isBackendConfigured,
+  JumpCalculationInput,
+  LocationData,
+  logCallForHelp,
+  SavedCalculation,
+  saveCalculationLocally,
+  sendNearbyRidersAlert,
+  setLastNearbyAlertSentAt,
+} from '@/lib/appSupport';
 
-const EXPO_PUBLIC_BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL;
 const { width } = Dimensions.get('window');
-
-interface TrajectoryPoint {
-  x: number;
-  y: number;
-  time: number;
-}
-
-interface CalculationResult {
-  id: string;
-  input_data: {
-    ramp_height: number;
-    ramp_angle: number;
-    gap_distance: number;
-    bike_weight: number;
-    rider_weight: number;
-    landing_height: number;
-    unit_system: string;
-  };
-  required_speed_mph: number;
-  required_speed_kph: number;
-  safety_speed_mph: number;
-  safety_speed_kph: number;
-  total_weight_lbs: number;
-  total_weight_kg: number;
-  flight_time_seconds: number;
-  max_height_feet: number;
-  max_height_meters: number;
-  landing_velocity_mph: number;
-  landing_velocity_kph: number;
-  trajectory_points: TrajectoryPoint[];
-  warnings: string[];
-}
-
-interface LocationData {
-  latitude: number;
-  longitude: number;
-  address?: string;
-}
 
 export default function Index() {
   // Input states
@@ -87,28 +67,39 @@ export default function Index() {
   const [isSaving, setIsSaving] = useState(false);
   const [currentLocation, setCurrentLocation] = useState<LocationData | null>(null);
 
-  // Request location permission on mount
-  useEffect(() => {
-    (async () => {
+  // Emergency alert states
+  const [showCallHelpModal, setShowCallHelpModal] = useState(false);
+  const [showAlertRidersModal, setShowAlertRidersModal] = useState(false);
+  const [isSendingAlert, setIsSendingAlert] = useState(false);
+
+  const loadCurrentLocation = async () => {
+    try {
       const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status === 'granted') {
-        try {
-          const location = await Location.getCurrentPositionAsync({});
-          const address = await Location.reverseGeocodeAsync({
-            latitude: location.coords.latitude,
-            longitude: location.coords.longitude,
-          });
-          setCurrentLocation({
-            latitude: location.coords.latitude,
-            longitude: location.coords.longitude,
-            address: address[0] ? `${address[0].city || ''}, ${address[0].region || ''}` : undefined,
-          });
-        } catch (error) {
-          console.log('Error getting location:', error);
-        }
+      if (status !== 'granted') {
+        setCurrentLocation(null);
+        return null;
       }
-    })();
-  }, []);
+
+      const location = await Location.getCurrentPositionAsync({});
+      const address = await Location.reverseGeocodeAsync({
+        latitude: location.coords.latitude,
+        longitude: location.coords.longitude,
+      });
+      const nextLocation = {
+        latitude: location.coords.latitude,
+        longitude: location.coords.longitude,
+        address: address[0]
+          ? `${address[0].city || ''}${address[0].city && address[0].region ? ', ' : ''}${address[0].region || ''}`
+          : undefined,
+      };
+      setCurrentLocation(nextLocation);
+      return nextLocation;
+    } catch (error) {
+      console.log('Error getting location:', error);
+      setCurrentLocation(null);
+      return null;
+    }
+  };
 
   // Animation effect
   useEffect(() => {
@@ -130,7 +121,7 @@ export default function Index() {
       
       requestAnimationFrame(animate);
     }
-  }, [isAnimating]);
+  }, [isAnimating, result]);
 
   const validateInputs = (): boolean => {
     if (!rampAngle || !gapDistance || !bikeWeight || !riderWeight) {
@@ -160,28 +151,34 @@ export default function Index() {
     setResult(null);
 
     try {
-      const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/calculate-jump`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          ramp_height: parseFloat(rampHeight) || 0,
-          ramp_angle: parseFloat(rampAngle),
-          gap_distance: parseFloat(gapDistance),
-          bike_weight: parseFloat(bikeWeight),
-          rider_weight: parseFloat(riderWeight),
-          landing_height: parseFloat(landingHeight) || 0,
-          unit_system: useMetric ? 'metric' : 'imperial',
-        }),
-      });
+      const inputData: JumpCalculationInput = {
+        ramp_height: parseFloat(rampHeight) || 0,
+        ramp_angle: parseFloat(rampAngle),
+        gap_distance: parseFloat(gapDistance),
+        bike_weight: parseFloat(bikeWeight),
+        rider_weight: parseFloat(riderWeight),
+        landing_height: parseFloat(landingHeight) || 0,
+        unit_system: useMetric ? 'metric' : 'imperial',
+      };
 
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || 'Calculation failed');
+      let data: CalculationResult;
+
+      if (isBackendConfigured) {
+        try {
+          data = await fetchJsonWithBackend<CalculationResult>('/api/calculate-jump', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(inputData),
+          });
+        } catch {
+          data = calculateJumpLocally(inputData);
+        }
+      } else {
+        data = calculateJumpLocally(inputData);
       }
 
-      const data = await response.json();
       setResult(data);
       // Start animation
       setAnimationProgress(0);
@@ -205,6 +202,11 @@ export default function Index() {
   };
 
   const handleSave = async () => {
+    if (!result) {
+      Alert.alert('Error', 'Run a calculation before saving.');
+      return;
+    }
+
     if (!saveName.trim()) {
       Alert.alert('Error', 'Please enter a name for this calculation.');
       return;
@@ -212,38 +214,69 @@ export default function Index() {
 
     setIsSaving(true);
     try {
-      const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/save-calculation`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: saveName,
-          description: saveDescription,
-          calculation: result,
-          location: includeLocation ? currentLocation : null,
-          share: shareCalculation,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to save calculation');
+      if (shareCalculation && !isBackendConfigured) {
+        throw new Error('Share codes require the backend so other riders can look them up.');
       }
 
-      const savedData = await response.json();
+      const deviceId = await getDeviceId();
+      const locationToSave =
+        includeLocation && !currentLocation
+          ? await loadCurrentLocation()
+          : currentLocation;
+      const payload = {
+        device_id: deviceId,
+        name: saveName,
+        description: saveDescription,
+        calculation: result,
+        location: includeLocation ? locationToSave : null,
+        share: shareCalculation,
+      };
+
+      let savedData: SavedCalculation;
+      let savedLocallyWithoutShare = false;
+
+      if (isBackendConfigured) {
+        try {
+          savedData = await fetchJsonWithBackend<SavedCalculation>(
+            '/api/save-calculation',
+            {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(payload),
+            }
+          );
+        } catch {
+          savedData = await saveCalculationLocally({
+            ...payload,
+            share: shareCalculation ? false : payload.share,
+          });
+          savedLocallyWithoutShare = shareCalculation;
+        }
+      } else {
+        savedData = await saveCalculationLocally(payload);
+      }
       
       setShowSaveModal(false);
       setSaveName('');
       setSaveDescription('');
       
-      if (shareCalculation && savedData.share_code) {
+      const shareCode = savedData.share_code;
+
+      if (shareCalculation && shareCode) {
         Alert.alert(
           'Saved & Shared!',
-          `Your calculation has been saved.\n\nShare Code: ${savedData.share_code}`,
+          `Your calculation has been saved.\n\nShare Code: ${shareCode}`,
           [
-            { text: 'Copy Code', onPress: () => handleShareCode(savedData.share_code) },
+            { text: 'Copy Code', onPress: () => handleShareCode(shareCode) },
             { text: 'OK' },
           ]
+        );
+      } else if (savedLocallyWithoutShare) {
+        Alert.alert(
+          'Saved Locally',
+          'The calculation was saved on this device, but a share code could not be created because the backend was unavailable.'
         );
       } else {
         Alert.alert('Saved!', 'Your calculation has been saved successfully.');
@@ -282,6 +315,122 @@ export default function Index() {
     setIsAnimating(true);
   };
 
+  const openSaveModal = async () => {
+    setShowSaveModal(true);
+
+    if (includeLocation && !currentLocation) {
+      await loadCurrentLocation();
+    }
+  };
+
+  const toggleIncludeLocation = async () => {
+    const nextValue = !includeLocation;
+    setIncludeLocation(nextValue);
+
+    if (nextValue && !currentLocation) {
+      await loadCurrentLocation();
+    }
+  };
+
+  const toggleShareCalculation = () => {
+    if (!isBackendConfigured) {
+      Alert.alert(
+        'Backend Required',
+        'Share codes are only available when the backend is configured, because other riders need a shared lookup service.'
+      );
+      return;
+    }
+
+    setShareCalculation(!shareCalculation);
+  };
+
+  const openCallHelpModal = () => {
+    setShowCallHelpModal(true);
+  };
+
+  const confirmCallForHelp = async () => {
+    setShowCallHelpModal(false);
+
+    // Logging is strictly best-effort and silent: console.log only, never an Alert,
+    // and never awaited before opening the dialer so emergency calling is never delayed.
+    void (async () => {
+      try {
+        const emergencyDeviceId = await getEmergencyDeviceId();
+        const location = currentLocation ?? (await loadCurrentLocation());
+        await logCallForHelp(emergencyDeviceId, location);
+      } catch (error) {
+        console.log('Error logging call-for-help attempt:', error);
+      }
+    })();
+
+    try {
+      // This only opens the phone dialer pre-filled with 911 — the user must
+      // still manually press "Call". The app never auto-dials.
+      await Linking.openURL('tel:911');
+    } catch {
+      Alert.alert('Unable to Open Dialer', 'Please dial 911 manually from your phone.');
+    }
+  };
+
+  const openAlertRidersModal = async () => {
+    try {
+      const emergencyDeviceId = await getEmergencyDeviceId();
+      const settings = await getEmergencySettings(emergencyDeviceId);
+
+      if (!settings.location_sharing_enabled) {
+        Alert.alert(
+          'Location Sharing Required',
+          'Enable location sharing in Emergency Settings before alerting nearby riders. Your exact location is never broadcast — it is only used to privately check who is within 5 miles.'
+        );
+        return;
+      }
+
+      setShowAlertRidersModal(true);
+    } catch (error: any) {
+      Alert.alert('Error', error.message || 'Unable to check emergency settings.');
+    }
+  };
+
+  const confirmAlertNearbyRiders = async () => {
+    setShowAlertRidersModal(false);
+
+    const lastSentAt = await getLastNearbyAlertSentAt();
+    const remainingCooldownMs = getRemainingAlertCooldownMs(lastSentAt);
+    if (remainingCooldownMs > 0) {
+      Alert.alert(
+        'Please Wait',
+        `To prevent spam, you can send another rider alert in ${Math.ceil(remainingCooldownMs / 1000)} seconds.`
+      );
+      return;
+    }
+
+    setIsSendingAlert(true);
+    try {
+      const emergencyDeviceId = await getEmergencyDeviceId();
+      const location = currentLocation ?? (await loadCurrentLocation());
+
+      if (!location) {
+        throw new Error('Location is required to alert nearby riders. Please enable location access.');
+      }
+
+      if (isBackendConfigured) {
+        const response = await sendNearbyRidersAlert(emergencyDeviceId, location);
+        await setLastNearbyAlertSentAt(Date.now());
+        Alert.alert('Alert Sent', response.message);
+      } else {
+        await setLastNearbyAlertSentAt(Date.now());
+        Alert.alert(
+          'Backend Unavailable',
+          'Nearby riders could not be notified because the backend is not configured. Always call 911 directly for real emergencies.'
+        );
+      }
+    } catch (error: any) {
+      Alert.alert('Error', error.message || 'Failed to send alert. Please try again or call 911 directly.');
+    } finally {
+      setIsSendingAlert(false);
+    }
+  };
+
   const distanceUnit = useMetric ? 'm' : 'ft';
   const weightUnit = useMetric ? 'kg' : 'lbs';
   const speedUnit = useMetric ? 'km/h' : 'mph';
@@ -313,6 +462,10 @@ export default function Index() {
     // Current bike position based on animation
     const currentIndex = Math.floor(animationProgress * (points.length - 1));
     const currentPoint = points[currentIndex] || points[0];
+    const landingHeightFeet =
+      result.input_data.unit_system === 'metric'
+        ? (result.input_data.landing_height || 0) * 3.28084
+        : result.input_data.landing_height || 0;
     
     // Ramp visualization
     const rampLength = maxX * 0.15;
@@ -360,9 +513,9 @@ export default function Index() {
           {/* Landing zone */}
           <Line
             x1={transformX(maxX * 0.85)}
-            y1={transformY(result.input_data.landing_height || 0)}
+            y1={transformY(landingHeightFeet)}
             x2={svgWidth - padding}
-            y2={transformY(result.input_data.landing_height || 0)}
+            y2={transformY(landingHeightFeet)}
             stroke="#4CAF50"
             strokeWidth="3"
           />
@@ -625,7 +778,7 @@ export default function Index() {
                   <TouchableOpacity onPress={handleQuickShare} style={styles.actionButton}>
                     <Ionicons name="share-social" size={20} color="#2196F3" />
                   </TouchableOpacity>
-                  <TouchableOpacity onPress={() => setShowSaveModal(true)} style={styles.actionButton}>
+                  <TouchableOpacity onPress={openSaveModal} style={styles.actionButton}>
                     <Ionicons name="bookmark" size={20} color="#FF6B35" />
                   </TouchableOpacity>
                 </View>
@@ -703,6 +856,43 @@ export default function Index() {
                   ))}
                 </View>
               )}
+
+              {/* Emergency Alerts */}
+              <View style={styles.emergencyContainer}>
+                <View style={styles.emergencyDisclaimer}>
+                  <Ionicons name="alert-circle-outline" size={16} color="#FF9800" />
+                  <Text style={styles.emergencyDisclaimerText}>
+                    This feature is NOT a substitute for calling 911. In emergencies, call 911 directly.
+                  </Text>
+                </View>
+
+                <TouchableOpacity
+                  style={styles.callHelpButton}
+                  onPress={openCallHelpModal}
+                  accessibilityRole="button"
+                  accessibilityLabel="Call for Help. Opens your phone dialer pre-filled with 911."
+                >
+                  <Ionicons name="alert-circle" size={26} color="#fff" />
+                  <Text style={styles.callHelpButtonText}>Call for Help</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={styles.alertRidersButton}
+                  onPress={openAlertRidersModal}
+                  disabled={isSendingAlert}
+                  accessibilityRole="button"
+                  accessibilityLabel="Alert Nearby Riders. Notifies opted-in riders within 5 miles that help may be needed."
+                >
+                  {isSendingAlert ? (
+                    <ActivityIndicator color="#fff" />
+                  ) : (
+                    <>
+                      <Ionicons name="heart" size={26} color="#fff" />
+                      <Text style={styles.alertRidersButtonText}>Alert Nearby Riders</Text>
+                    </>
+                  )}
+                </TouchableOpacity>
+              </View>
             </View>
           )}
 
@@ -759,7 +949,7 @@ export default function Index() {
 
               <TouchableOpacity
                 style={styles.optionRow}
-                onPress={() => setIncludeLocation(!includeLocation)}
+                onPress={toggleIncludeLocation}
               >
                 <Ionicons
                   name={includeLocation ? 'checkbox' : 'square-outline'}
@@ -776,7 +966,7 @@ export default function Index() {
 
               <TouchableOpacity
                 style={styles.optionRow}
-                onPress={() => setShareCalculation(!shareCalculation)}
+                onPress={toggleShareCalculation}
               >
                 <Ionicons
                   name={shareCalculation ? 'checkbox' : 'square-outline'}
@@ -785,7 +975,9 @@ export default function Index() {
                 />
                 <View style={styles.optionContent}>
                   <Text style={styles.optionTitle}>Share with Others</Text>
-                  <Text style={styles.optionSubtitle}>Generate a share code</Text>
+                  <Text style={styles.optionSubtitle}>
+                    {isBackendConfigured ? 'Generate a share code' : 'Requires backend connection'}
+                  </Text>
                 </View>
               </TouchableOpacity>
 
@@ -802,6 +994,80 @@ export default function Index() {
                     <Text style={styles.saveButtonText}>Save Calculation</Text>
                   </>
                 )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Call for Help Confirmation Modal */}
+      <Modal
+        visible={showCallHelpModal}
+        animationType="fade"
+        transparent={true}
+        onRequestClose={() => setShowCallHelpModal(false)}
+      >
+        <View style={styles.confirmModalOverlay}>
+          <View style={styles.confirmModalContent}>
+            <Ionicons name="alert-circle" size={40} color="#E91E63" style={styles.confirmModalIcon} />
+            <Text style={styles.confirmModalTitle}>Are you injured?</Text>
+            <Text style={styles.confirmModalBody}>
+              You will be calling emergency services directly. This opens your phone&apos;s dialer
+              pre-filled with 911 — you must press Call to connect.
+            </Text>
+
+            <View style={styles.confirmModalActions}>
+              <TouchableOpacity
+                style={styles.confirmModalCancelButton}
+                onPress={() => setShowCallHelpModal(false)}
+              >
+                <Text style={styles.confirmModalCancelText}>Cancel</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.confirmModalCallButton}
+                onPress={confirmCallForHelp}
+              >
+                <Ionicons name="call" size={18} color="#fff" />
+                <Text style={styles.confirmModalCallText}>Call 911</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Alert Nearby Riders Confirmation Modal */}
+      <Modal
+        visible={showAlertRidersModal}
+        animationType="fade"
+        transparent={true}
+        onRequestClose={() => setShowAlertRidersModal(false)}
+      >
+        <View style={styles.confirmModalOverlay}>
+          <View style={styles.confirmModalContent}>
+            <Ionicons name="heart" size={40} color="#4CAF50" style={styles.confirmModalIcon} />
+            <Text style={styles.confirmModalTitle}>Alert nearby riders?</Text>
+            <Text style={styles.confirmModalBody}>
+              Other riders within 5 miles will be notified that help may be needed.
+            </Text>
+            <Text style={styles.confirmModalDisclaimer}>
+              This is an unverified report. Always call 911 for emergencies.
+            </Text>
+
+            <View style={styles.confirmModalActions}>
+              <TouchableOpacity
+                style={styles.confirmModalCancelButton}
+                onPress={() => setShowAlertRidersModal(false)}
+              >
+                <Text style={styles.confirmModalCancelText}>Cancel</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.confirmModalAlertButton}
+                onPress={confirmAlertNearbyRiders}
+              >
+                <Ionicons name="send" size={18} color="#fff" />
+                <Text style={styles.confirmModalAlertText}>Send Alert</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -1126,6 +1392,151 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: '#888',
     lineHeight: 18,
+  },
+  // Emergency alert styles
+  emergencyContainer: {
+    marginTop: 16,
+  },
+  emergencyDisclaimer: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    backgroundColor: 'rgba(255, 152, 0, 0.1)',
+    borderRadius: 12,
+    padding: 12,
+    gap: 8,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 152, 0, 0.3)',
+  },
+  emergencyDisclaimerText: {
+    flex: 1,
+    fontSize: 12,
+    color: '#FFB74D',
+    lineHeight: 16,
+    fontWeight: '600',
+  },
+  callHelpButton: {
+    backgroundColor: '#E91E63',
+    borderRadius: 12,
+    padding: 18,
+    minHeight: 56,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+    marginBottom: 12,
+  },
+  callHelpButtonText: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: 'bold',
+  },
+  alertRidersButton: {
+    backgroundColor: '#4CAF50',
+    borderRadius: 12,
+    padding: 18,
+    minHeight: 56,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+  },
+  alertRidersButtonText: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: 'bold',
+  },
+  confirmModalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.8)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 24,
+  },
+  confirmModalContent: {
+    width: '100%',
+    maxWidth: 400,
+    backgroundColor: '#1E1E1E',
+    borderRadius: 20,
+    padding: 24,
+    alignItems: 'center',
+  },
+  confirmModalIcon: {
+    marginBottom: 12,
+  },
+  confirmModalTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#fff',
+    marginBottom: 12,
+    textAlign: 'center',
+  },
+  confirmModalBody: {
+    fontSize: 14,
+    color: '#ccc',
+    textAlign: 'center',
+    lineHeight: 20,
+    marginBottom: 8,
+  },
+  confirmModalDisclaimer: {
+    fontSize: 12,
+    color: '#FF9800',
+    textAlign: 'center',
+    lineHeight: 18,
+    marginBottom: 8,
+    fontWeight: '600',
+  },
+  confirmModalActions: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 16,
+    width: '100%',
+  },
+  confirmModalCancelButton: {
+    flex: 1,
+    backgroundColor: '#2A2A2A',
+    borderRadius: 12,
+    padding: 16,
+    minHeight: 48,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  confirmModalCancelText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  confirmModalCallButton: {
+    flex: 1,
+    backgroundColor: '#E91E63',
+    borderRadius: 12,
+    padding: 16,
+    minHeight: 48,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  confirmModalCallText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  confirmModalAlertButton: {
+    flex: 1,
+    backgroundColor: '#4CAF50',
+    borderRadius: 12,
+    padding: 16,
+    minHeight: 48,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  confirmModalAlertText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: 'bold',
   },
   // Modal styles
   modalOverlay: {

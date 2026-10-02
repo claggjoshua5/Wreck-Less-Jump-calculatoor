@@ -64,7 +64,7 @@ export default function ARMeasureView({ onMeasurement, onClose }: Props) {
         <View style={styles.capList}>
           <View style={styles.capItem}>
             <View style={styles.capIcon}>
-              <Ionicons name="resize-horizontal" size={20} color="#4CAF50" />
+              <Ionicons name="resize" size={20} color="#4CAF50" />
             </View>
             <View style={styles.capContent}>
               <Text style={styles.capTitle}>Gap Distance</Text>

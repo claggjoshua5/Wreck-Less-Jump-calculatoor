@@ -1,8 +1,12 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Request
+from fastapi import FastAPI, APIRouter, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+import hashlib
+import hmac
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError, OperationFailure
 import os
 import logging
 from pathlib import Path
@@ -11,6 +15,8 @@ from typing import List, Optional, Dict
 import uuid
 from datetime import datetime, timedelta
 import math
+import asyncio
+import random
 
 # Load environment variables
 ROOT_DIR = Path(__file__).parent
@@ -47,14 +53,16 @@ class StatusCheckCreate(BaseModel):
 
 # Location Model
 class LocationData(BaseModel):
-    latitude: float
-    longitude: float
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
     address: Optional[str] = None
 
 
 # Payment Models
 class CreateCheckoutRequest(BaseModel):
-    origin_url: str
+    origin_url: Optional[str] = None
+    success_url: Optional[str] = None
+    cancel_url: Optional[str] = None
     device_id: str
 
 
@@ -143,6 +151,7 @@ class JumpCalculationResult(BaseModel):
 
 class SavedCalculation(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    device_id: Optional[str] = None
     name: str
     description: Optional[str] = None
     calculation: JumpCalculationResult
@@ -153,6 +162,7 @@ class SavedCalculation(BaseModel):
 
 
 class SaveCalculationRequest(BaseModel):
+    device_id: str
     name: str
     description: Optional[str] = None
     calculation: JumpCalculationResult
@@ -162,6 +172,84 @@ class SaveCalculationRequest(BaseModel):
 
 class ShareCalculationRequest(BaseModel):
     calculation_id: str
+
+
+# Emergency Alert Models
+DEFAULT_ALERT_COOLDOWN_MS = 5 * 60 * 1000  # 5 minutes
+NEARBY_RIDER_RADIUS_MILES = 5.0
+# Minimum time between two call-for-help rows logged for the same emergency_device_id.
+# This is a basic write throttle only (see call_for_help); real per-IP rate limiting
+# needs infrastructure (reverse proxy / middleware) and is out of scope here.
+CALL_FOR_HELP_THROTTLE_SECONDS = 10
+# Unauthenticated call-for-help rows must not accumulate forever; TTL-expire them from
+# emergency_alerts after this many seconds (30 days).
+EMERGENCY_ALERT_RETENTION_SECONDS = 30 * 24 * 60 * 60
+
+
+class EmergencySettings(BaseModel):
+    # emergency_device_id is a separate, high-entropy identifier generated on-device
+    # specifically for the emergency-alert feature. It is never returned by
+    # /api/shared/{share_code} or any other endpoint, unlike the general device_id used
+    # for saved calculations, so a share-code holder can never learn or claim it.
+    emergency_device_id: str
+    allow_notifications: bool = True
+    location_sharing_enabled: bool = False
+    alert_cooldown_ms: int = DEFAULT_ALERT_COOLDOWN_MS
+    last_known_location: Optional[LocationData] = None
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class EmergencySettingsPublic(BaseModel):
+    allow_notifications: bool
+    location_sharing_enabled: bool
+    alert_cooldown_ms: int
+    has_location: bool
+
+
+def to_public(settings: EmergencySettings) -> EmergencySettingsPublic:
+    return EmergencySettingsPublic(
+        allow_notifications=settings.allow_notifications,
+        location_sharing_enabled=settings.location_sharing_enabled,
+        alert_cooldown_ms=settings.alert_cooldown_ms,
+        has_location=settings.last_known_location is not None,
+    )
+
+
+class EmergencySettingsUpdate(BaseModel):
+    allow_notifications: Optional[bool] = None
+    location_sharing_enabled: Optional[bool] = None
+    location: Optional[LocationData] = None
+
+
+class EmergencyAlert(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    emergency_device_id: str
+    alert_type: str  # "call_for_help" or "nearby_riders"
+    location: Optional[LocationData] = None
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+
+class CallForHelpRequest(BaseModel):
+    emergency_device_id: str
+    location: Optional[LocationData] = None
+
+
+class CallForHelpResponse(BaseModel):
+    success: bool
+    message: str
+    alert_id: str
+
+
+class AlertNearbyRidersRequest(BaseModel):
+    emergency_device_id: str
+    location: LocationData
+
+
+class AlertNearbyRidersResponse(BaseModel):
+    success: bool
+    message: str
+    alerted_count: int
+    alert_id: str
 
 
 def generate_trajectory_points(
@@ -251,18 +339,80 @@ def generate_share_code() -> str:
     return uuid.uuid4().hex[:8].upper()
 
 
+def get_payment_webhook_base_url(http_request: Request) -> str:
+    configured_base = os.environ.get("PUBLIC_BACKEND_URL", "").strip().rstrip("/")
+    if configured_base:
+        return configured_base
+    return str(http_request.base_url).rstrip("/")
+
+
+def require_nonblank_id(value: Optional[str], field_name: str) -> str:
+    normalized = (value or "").strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail=f"{field_name} is required")
+    return normalized
+
+
+def require_device_id(device_id: Optional[str]) -> str:
+    return require_nonblank_id(device_id, "device_id")
+
+
+def require_emergency_device_id(emergency_device_id: Optional[str]) -> str:
+    return require_nonblank_id(emergency_device_id, "emergency_device_id")
+
+
+def haversine_distance_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two lat/lon points, in miles."""
+    earth_radius_miles = 3958.8
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+    a = math.sin(delta_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
+    return 2 * earth_radius_miles * math.asin(min(1, math.sqrt(a)))
+
+
+def bounding_box(lat: float, lon: float, radius_miles: float):
+    """Rough lat/lon bounding box around a point, used as a cheap prefilter query before the
+    exact haversine check. Errs on the side of being slightly too generous rather than
+    excluding a rider that should match."""
+    miles_per_lat_degree = 69.0
+    lat_delta = radius_miles / miles_per_lat_degree
+    miles_per_lon_degree = max(miles_per_lat_degree * math.cos(math.radians(lat)), 1.0)
+    lon_delta = radius_miles / miles_per_lon_degree
+
+    min_lat = max(-90.0, lat - lat_delta)
+    max_lat = min(90.0, lat + lat_delta)
+    min_lon = max(-180.0, lon - lon_delta)
+    max_lon = min(180.0, lon + lon_delta)
+    return min_lat, max_lat, min_lon, max_lon
+
+
+def calculate_safety_margin(total_weight_lbs: float, ramp_height_ft: float, ramp_angle_deg: float) -> float:
+    weight_margin = max(0, (total_weight_lbs - 350) / 1500)
+    short_ramp_margin = max(0, (4 - ramp_height_ft) * 0.01) if ramp_height_ft > 0 else 0.04
+    steep_ramp_margin = min((ramp_angle_deg - 35) / 300, 0.08) if ramp_angle_deg > 35 else 0
+    return min(0.35, 0.15 + weight_margin + short_ramp_margin + steep_ramp_margin)
+
+
 # ==================== PAYMENT ENDPOINTS ====================
 
 @api_router.post("/payments/create-checkout", response_model=CheckoutResponse)
 async def create_checkout_session(request: CreateCheckoutRequest, http_request: Request):
-    """Create a Stripe checkout session for monthly subscription (no trial)."""
+    """Create a Stripe checkout session for a 30-day access pass."""
     try:
-        host_url = request.origin_url.rstrip('/')
-        webhook_url = f"{host_url}/api/webhook/stripe"
+        if not STRIPE_API_KEY:
+            raise HTTPException(status_code=503, detail="Payments are not configured")
+
+        webhook_base_url = get_payment_webhook_base_url(http_request)
+        webhook_url = f"{webhook_base_url}/api/webhook/stripe"
         stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
-        
-        success_url = f"{host_url}/payment-success?session_id={{CHECKOUT_SESSION_ID}}"
-        cancel_url = f"{host_url}/payment-cancel"
+
+        host_url = (request.origin_url or "").rstrip("/")
+        success_url = request.success_url or (f"{host_url}/payment-success?session_id={{CHECKOUT_SESSION_ID}}" if host_url else None)
+        cancel_url = request.cancel_url or (f"{host_url}/payment-cancel" if host_url else None)
+
+        if not success_url or not cancel_url:
+            raise HTTPException(status_code=400, detail="Valid payment return URLs are required")
         
         checkout_request = CheckoutSessionRequest(
             amount=SUBSCRIPTION_PRICE,
@@ -271,7 +421,7 @@ async def create_checkout_session(request: CreateCheckoutRequest, http_request: 
             cancel_url=cancel_url,
             metadata={
                 "device_id": request.device_id,
-                "subscription_type": "monthly",
+                "subscription_type": "thirty_day_access",
                 "product": "dirt_bike_jump_calculator",
                 "has_trial": "false"
             }
@@ -293,6 +443,8 @@ async def create_checkout_session(request: CreateCheckoutRequest, http_request: 
             checkout_url=session.url,
             session_id=session.session_id
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Error creating checkout session: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to create checkout: {str(e)}")
@@ -355,8 +507,10 @@ async def start_free_trial(request: StartTrialRequest):
 async def get_payment_status(session_id: str, http_request: Request):
     """Check the status of a payment session."""
     try:
-        origin = str(http_request.base_url).rstrip('/')
-        webhook_url = f"{origin}/api/webhook/stripe"
+        if not STRIPE_API_KEY:
+            raise HTTPException(status_code=503, detail="Payments are not configured")
+
+        webhook_url = f"{get_payment_webhook_base_url(http_request)}/api/webhook/stripe"
         stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
         
         checkout_status = await stripe_checkout.get_checkout_status(session_id)
@@ -379,7 +533,7 @@ async def get_payment_status(session_id: str, http_request: Request):
                     trial_ends_at = now + timedelta(days=3)
                     subscription_expires_at = now + timedelta(days=33)  # 3 day trial + 30 day subscription
                 else:
-                    # Direct subscription: 30 days
+                    # Direct purchase: 30 days of access
                     trial_ends_at = None
                     subscription_expires_at = now + timedelta(days=30)
                 
@@ -477,7 +631,7 @@ async def get_subscription_status(device_id: str):
                         expires_at=expires_at,
                         device_id=device_id,
                         is_trial=False,
-                        status_message="Premium subscriber"
+                        status_message="30-day access active"
                     )
             
             return SubscriptionStatus(
@@ -485,16 +639,16 @@ async def get_subscription_status(device_id: str):
                 expires_at=expires_at,
                 device_id=device_id,
                 is_trial=False,
-                status_message="Premium subscriber"
+                status_message="30-day access active"
             )
     
-    # No subscription - user needs to start trial with credit card
+    # No active access
     return SubscriptionStatus(
         is_active=False,
         device_id=device_id,
         is_trial=False,
         trial_info=None,
-        status_message="Start your 3-day free trial"
+        status_message="Start your 3-day trial or unlock 30-day access"
     )
 
 
@@ -502,11 +656,14 @@ async def get_subscription_status(device_id: str):
 async def stripe_webhook(request: Request):
     """Handle Stripe webhook events."""
     try:
+        if not STRIPE_API_KEY:
+            raise HTTPException(status_code=503, detail="Payments are not configured")
+
         body = await request.body()
         signature = request.headers.get("Stripe-Signature")
         
         # Initialize Stripe
-        host_url = str(request.base_url).rstrip('/')
+        host_url = get_payment_webhook_base_url(request)
         webhook_url = f"{host_url}/api/webhook/stripe"
         stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
         
@@ -548,9 +705,11 @@ async def stripe_webhook(request: Request):
                     )
         
         return {"status": "ok"}
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Webhook error: {str(e)}")
-        return {"status": "error", "message": str(e)}
+        raise HTTPException(status_code=500, detail=f"Webhook error: {str(e)}")
 
 
 # ==================== CALCULATOR ENDPOINTS ====================
@@ -609,6 +768,7 @@ async def privacy_policy():
         <ul>
             <li><strong>Device Information:</strong> A unique device identifier to manage your subscription and saved calculations.</li>
             <li><strong>Location Data:</strong> If you choose to save a calculation with location, we store the GPS coordinates. This is optional and only collected with your permission.</li>
+            <li><strong>Emergency Location Data:</strong> If you enable emergency location sharing, we store your last known location and use it only to determine whether other opted-in riders are nearby when you request an alert. You can disable sharing at any time.</li>
             <li><strong>Calculation Data:</strong> Jump calculations you choose to save, including ramp measurements and results.</li>
             <li><strong>Payment Information:</strong> Processed securely through Stripe. We do not store your credit card details.</li>
             <li><strong>Camera Data:</strong> Photos taken for measurement are processed locally on your device and are not uploaded to our servers.</li>
@@ -680,10 +840,12 @@ async def calculate_jump(input_data: JumpCalculationInput):
     
     gap_distance_ft = input_data.gap_distance
     landing_height_ft = input_data.landing_height or 0
+    ramp_height_ft = input_data.ramp_height or 0
     
     if input_data.unit_system == "metric":
         gap_distance_ft = input_data.gap_distance * 3.28084
         landing_height_ft = (input_data.landing_height or 0) * 3.28084
+        ramp_height_ft = (input_data.ramp_height or 0) * 3.28084
     
     try:
         result = calculate_jump_speed(
@@ -694,9 +856,9 @@ async def calculate_jump(input_data: JumpCalculationInput):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     
-    safety_factor = 1.15
-    safety_speed_mph = round(result["required_speed_mph"] * safety_factor, 2)
-    safety_speed_kph = round(result["required_speed_kph"] * safety_factor, 2)
+    safety_margin = calculate_safety_margin(total_weight_lbs, ramp_height_ft, input_data.ramp_angle)
+    safety_speed_mph = round(result["required_speed_mph"] * (1 + safety_margin), 2)
+    safety_speed_kph = round(result["required_speed_kph"] * (1 + safety_margin), 2)
     
     if result["required_speed_mph"] > 60:
         warnings.append("High speed required! This is an advanced jump. Ensure proper safety gear and experience.")
@@ -709,6 +871,9 @@ async def calculate_jump(input_data: JumpCalculationInput):
     
     if result["landing_velocity_mph"] > 50:
         warnings.append("High landing velocity. Ensure proper landing ramp and suspension setup.")
+
+    if ramp_height_ft > 0 and ramp_height_ft < 3:
+        warnings.append("Short takeoff ramp height reduces margin for body position and throttle correction.")
     
     calculation_result = JumpCalculationResult(
         input_data=input_data,
@@ -736,9 +901,11 @@ async def calculate_jump(input_data: JumpCalculationInput):
 @api_router.post("/save-calculation", response_model=SavedCalculation)
 async def save_calculation(request: SaveCalculationRequest):
     """Save a calculation with optional location and sharing."""
+    device_id = require_device_id(request.device_id)
     share_code = generate_share_code() if request.share else None
     
     saved_calc = SavedCalculation(
+        device_id=device_id,
         name=request.name,
         description=request.description,
         calculation=request.calculation,
@@ -753,34 +920,40 @@ async def save_calculation(request: SaveCalculationRequest):
 
 
 @api_router.get("/saved-calculations", response_model=List[SavedCalculation])
-async def get_saved_calculations(limit: int = 50):
+async def get_saved_calculations(device_id: str, limit: int = 50):
     """Get all saved calculations."""
-    calculations = await db.saved_calculations.find().sort("created_at", -1).limit(limit).to_list(limit)
+    normalized_device_id = require_device_id(device_id)
+    calculations = await db.saved_calculations.find(
+        {"device_id": normalized_device_id}
+    ).sort("created_at", -1).limit(limit).to_list(limit)
     return [SavedCalculation(**calc) for calc in calculations]
 
 
 @api_router.get("/saved-calculation/{calculation_id}", response_model=SavedCalculation)
-async def get_saved_calculation(calculation_id: str):
+async def get_saved_calculation(calculation_id: str, device_id: str):
     """Get a specific saved calculation by ID."""
-    calc = await db.saved_calculations.find_one({"id": calculation_id})
+    normalized_device_id = require_device_id(device_id)
+    calc = await db.saved_calculations.find_one({"id": calculation_id, "device_id": normalized_device_id})
     if not calc:
         raise HTTPException(status_code=404, detail="Calculation not found")
     return SavedCalculation(**calc)
 
 
 @api_router.delete("/saved-calculation/{calculation_id}")
-async def delete_saved_calculation(calculation_id: str):
+async def delete_saved_calculation(calculation_id: str, device_id: str):
     """Delete a saved calculation."""
-    result = await db.saved_calculations.delete_one({"id": calculation_id})
+    normalized_device_id = require_device_id(device_id)
+    result = await db.saved_calculations.delete_one({"id": calculation_id, "device_id": normalized_device_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Calculation not found")
     return {"message": "Calculation deleted"}
 
 
 @api_router.post("/share-calculation/{calculation_id}")
-async def share_calculation(calculation_id: str):
+async def share_calculation(calculation_id: str, device_id: str):
     """Make a calculation shareable and get share code."""
-    calc = await db.saved_calculations.find_one({"id": calculation_id})
+    normalized_device_id = require_device_id(device_id)
+    calc = await db.saved_calculations.find_one({"id": calculation_id, "device_id": normalized_device_id})
     if not calc:
         raise HTTPException(status_code=404, detail="Calculation not found")
     
@@ -806,10 +979,11 @@ async def get_shared_calculation(share_code: str):
 
 
 @api_router.get("/map-locations")
-async def get_map_locations():
+async def get_map_locations(device_id: str):
     """Get all calculations with locations for map display."""
+    normalized_device_id = require_device_id(device_id)
     calculations = await db.saved_calculations.find(
-        {"location": {"$ne": None}}
+        {"device_id": normalized_device_id, "location": {"$ne": None}}
     ).to_list(1000)
     
     locations = []
@@ -846,6 +1020,352 @@ async def clear_calculation_history():
     return {"message": f"Deleted {result.deleted_count} calculations"}
 
 
+# ==================== EMERGENCY ALERT ENDPOINTS ====================
+# NOTE: These endpoints never auto-dial or auto-broadcast on their own.
+# The frontend always requires an explicit, confirmed user action first.
+#
+# All auth here keys on emergency_device_id, a separate high-entropy identifier that is
+# never exposed by any endpoint (unlike the general device_id used for saved calculations,
+# which /api/shared/{share_code} does return). This prevents anyone who learns a rider's
+# general device_id from taking over that rider's emergency settings/token.
+
+
+async def verify_device(emergency_device_id: str, token: Optional[str]) -> Dict:
+    """Verify (but never create) an emergency device's credentials.
+
+    Only matches documents that already have both emergency_device_id and token_hash, so
+    legacy emergency_settings rows created before this identifier existed can never be
+    used for authentication, even if they happen to share a value with device_id.
+    """
+    settings = await db.emergency_settings.find_one(
+        {"emergency_device_id": emergency_device_id, "token_hash": {"$ne": None}}
+    )
+    token_hash = settings.get("token_hash") if settings else None
+    if not token_hash or not token or not hmac.compare_digest(token_hash, hashlib.sha256(token.encode()).hexdigest()):
+        raise HTTPException(status_code=401, detail="Invalid or missing device token.")
+    return settings
+
+
+async def enroll_or_verify(emergency_device_id: str, token: Optional[str]) -> Dict:
+    """Atomically enroll a brand-new emergency_device_id, or verify an existing one.
+
+    The client generates a high-entropy secret and persists it locally *before* sending
+    this request, so this is safe to retry: resending the same secret after a lost
+    response, timeout, or app restart always recovers the same claim. Enrollment is a
+    single upsert using $setOnInsert against the unique-indexed emergency_device_id field,
+    so concurrent first requests with the same secret all converge on one document, and
+    concurrent first requests with different secrets have exactly one winner.
+    """
+    if not token:
+        raise HTTPException(status_code=401, detail="Invalid or missing device token.")
+
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    now = datetime.utcnow()
+    try:
+        settings = await db.emergency_settings.find_one_and_update(
+            {"emergency_device_id": emergency_device_id},
+            {
+                "$setOnInsert": {
+                    "emergency_device_id": emergency_device_id,
+                    "token_hash": token_hash,
+                    "allow_notifications": True,
+                    "location_sharing_enabled": False,
+                    "alert_cooldown_ms": DEFAULT_ALERT_COOLDOWN_MS,
+                    "last_known_location": None,
+                    "updated_at": now,
+                }
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        # Lost the race to another concurrent first-enrollment request (real MongoDB can
+        # surface this from a racing upsert on a unique-indexed field); re-read whichever
+        # document won and verify against it below.
+        settings = await db.emergency_settings.find_one({"emergency_device_id": emergency_device_id})
+
+    if not settings or not hmac.compare_digest(settings.get("token_hash", ""), token_hash):
+        raise HTTPException(status_code=401, detail="Invalid or missing device token.")
+    return settings
+
+
+@api_router.get(
+    "/emergency/settings/{emergency_device_id}",
+    response_model=EmergencySettingsPublic,
+)
+async def get_emergency_settings(
+    emergency_device_id: str,
+    device_token: Optional[str] = Header(None, alias="X-Device-Token"),
+):
+    """Get a device's emergency alert preferences (location sharing, notifications, cooldown)."""
+    normalized_id = require_emergency_device_id(emergency_device_id)
+    doc = await db.emergency_settings.find_one(
+        {"emergency_device_id": normalized_id, "token_hash": {"$ne": None}}
+    )
+    # Tradeoff: unenrolled IDs return defaults without creating a record or requiring a token,
+    # while enrolled IDs require the matching token and return 401 on wrong/missing token.
+    # While this theoretically allows probing whether an ID is enrolled, emergency_device_id
+    # is a high-entropy, client-generated identifier that is never exposed to other users or
+    # returned by any API endpoint, making enumeration infeasible. Returning defaults allows
+    # first-time riders to view default settings before enrolling on their first settings update (POST).
+    if not doc:
+        return EmergencySettingsPublic(
+            allow_notifications=True,
+            location_sharing_enabled=False,
+            alert_cooldown_ms=DEFAULT_ALERT_COOLDOWN_MS,
+            has_location=False,
+        )
+
+    token_hash = doc.get("token_hash")
+    if not token_hash or not device_token or not hmac.compare_digest(
+        token_hash, hashlib.sha256(device_token.encode()).hexdigest()
+    ):
+        raise HTTPException(status_code=401, detail="Invalid or missing device token.")
+
+    return to_public(EmergencySettings(**doc))
+
+
+@api_router.post(
+    "/emergency/settings/{emergency_device_id}",
+    response_model=EmergencySettingsPublic,
+)
+async def update_emergency_settings(
+    emergency_device_id: str,
+    update: EmergencySettingsUpdate,
+    device_token: Optional[str] = Header(None, alias="X-Device-Token"),
+):
+    """Enroll (idempotently) or update a device's emergency alert preferences.
+
+    The server never returns the raw device token; the client generated and persisted it
+    before making this request, so it already has it.
+    """
+    normalized_id = require_emergency_device_id(emergency_device_id)
+    existing = await enroll_or_verify(normalized_id, device_token)
+
+    settings = EmergencySettings(**existing)
+
+    if update.allow_notifications is not None:
+        settings.allow_notifications = update.allow_notifications
+
+    if update.location_sharing_enabled is not None:
+        settings.location_sharing_enabled = update.location_sharing_enabled
+        if not update.location_sharing_enabled:
+            settings.last_known_location = None
+
+    if update.location is not None and settings.location_sharing_enabled:
+        settings.last_known_location = update.location
+
+    settings.updated_at = datetime.utcnow()
+
+    settings_data = settings.dict()
+    settings_data["token_hash"] = existing["token_hash"]
+    await db.emergency_settings.update_one(
+        {"emergency_device_id": normalized_id},
+        {"$set": settings_data},
+        upsert=True,
+    )
+    return to_public(settings)
+
+
+@api_router.post("/emergency/call-for-help", response_model=CallForHelpResponse)
+async def call_for_help(
+    request: CallForHelpRequest,
+    device_token: Optional[str] = Header(None, alias="X-Device-Token"),
+):
+    """Log an emergency call attempt. The app never auto-dials; this only records that
+    the user confirmed the action and was routed to their phone's dialer with 911 pre-filled.
+    Location is only stored if the device is enrolled, authenticated, and has opted into
+    location sharing."""
+    normalized_id = require_emergency_device_id(request.emergency_device_id)
+    settings_doc = await db.emergency_settings.find_one(
+        {"emergency_device_id": normalized_id, "token_hash": {"$ne": None}}
+    )
+    is_authenticated = False
+    if settings_doc and device_token:
+        token_hash = settings_doc.get("token_hash")
+        if token_hash and hmac.compare_digest(
+            token_hash, hashlib.sha256(device_token.encode()).hexdigest()
+        ):
+            is_authenticated = True
+
+    sharing_enabled = is_authenticated and bool(settings_doc and settings_doc.get("location_sharing_enabled"))
+    stored_location = request.location if sharing_enabled else None
+    message = "Emergency call attempt logged. Always confirm the call in your phone's dialer."
+
+    # This endpoint intentionally accepts unenrolled/unauthenticated callers (a rider in an
+    # emergency must never be blocked). A uniquely keyed per-device throttle document bounds
+    # writes while every valid call still receives the normal success response.
+    now = datetime.utcnow()
+    throttle_cutoff = now - timedelta(seconds=CALL_FOR_HELP_THROTTLE_SECONDS)
+    new_alert = EmergencyAlert(
+        emergency_device_id=normalized_id,
+        alert_type="call_for_help",
+        location=stored_location,
+        timestamp=now,
+    )
+    location_data = stored_location.dict() if stored_location else None
+    throttles = db.emergency_call_throttles
+    throttle_state = {
+        "emergency_device_id": normalized_id,
+        "alert_id": new_alert.id,
+        "timestamp": now,
+        "location": location_data,
+    }
+    create_alert = False
+    throttle_doc = None
+    while throttle_doc is None:
+        try:
+            await throttles.insert_one(throttle_state.copy())
+            throttle_doc = throttle_state
+            create_alert = True
+        except DuplicateKeyError:
+            # Updating only an expired state makes this the sole request that starts a new
+            # window. Concurrent requests that lose this update reuse the winner's alert id.
+            throttle_doc = await throttles.find_one_and_update(
+                {
+                    "emergency_device_id": normalized_id,
+                    "timestamp": {"$lt": throttle_cutoff},
+                },
+                {"$set": throttle_state},
+                return_document=ReturnDocument.AFTER,
+            )
+            if throttle_doc:
+                create_alert = True
+            else:
+                if location_data:
+                    await throttles.update_one(
+                        {
+                            "emergency_device_id": normalized_id,
+                            "timestamp": {"$gte": throttle_cutoff},
+                        },
+                        {"$set": {"location": location_data}},
+                    )
+                throttle_doc = await throttles.find_one(
+                    {"emergency_device_id": normalized_id}
+                )
+
+    if create_alert:
+        await db.emergency_alerts.insert_one(new_alert.dict())
+
+    alert_id = throttle_doc["alert_id"]
+    if create_alert:
+        # An authenticated request may have enriched the throttle state before its
+        # corresponding alert row was inserted.
+        latest_state = await throttles.find_one(
+            {"emergency_device_id": normalized_id}
+        )
+        if latest_state and latest_state.get("location"):
+            await db.emergency_alerts.update_one(
+                {"id": alert_id},
+                {"$set": {"location": latest_state["location"]}},
+            )
+    elif location_data:
+        await db.emergency_alerts.update_one(
+            {"id": alert_id},
+            {"$set": {"location": location_data}},
+        )
+
+    return CallForHelpResponse(success=True, message=message, alert_id=alert_id)
+
+
+@api_router.post("/emergency/alert-nearby-riders", response_model=AlertNearbyRidersResponse)
+async def alert_nearby_riders(
+    request: AlertNearbyRidersRequest,
+    device_token: Optional[str] = Header(None, alias="X-Device-Token"),
+):
+    """Log that a rider requested nearby help. Never broadcasts exact location publicly;
+    only used server-side to count opted-in devices that are nearby. Enforces a minimum
+    cooldown between alerts from the same device to prevent spam.
+
+    NOTE: this only counts nearby devices and logs an alert — there is no push notification
+    or other delivery mechanism, so the response message must not claim riders were notified.
+    """
+    normalized_id = require_emergency_device_id(request.emergency_device_id)
+    settings_doc = await verify_device(normalized_id, device_token)
+
+    if not settings_doc or not settings_doc.get("location_sharing_enabled"):
+        raise HTTPException(
+            status_code=400,
+            detail="Enable location sharing in emergency settings before alerting nearby riders.",
+        )
+
+    cooldown_ms = settings_doc.get("alert_cooldown_ms", DEFAULT_ALERT_COOLDOWN_MS)
+
+    # Atomic upsert on a per-device cooldown record instead of check-then-insert, to avoid a
+    # race where two concurrent requests both read "no recent alert" and both proceed.
+    now = datetime.utcnow()
+    cutoff = now - timedelta(milliseconds=cooldown_ms)
+    try:
+        await db.emergency_alert_cooldowns.find_one_and_update(
+            {
+                "emergency_device_id": normalized_id,
+                "$or": [
+                    {"last_alert_at": {"$exists": False}},
+                    {"last_alert_at": {"$lte": cutoff}},
+                ],
+            },
+            {"$set": {"emergency_device_id": normalized_id, "last_alert_at": now}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        existing = await db.emergency_alert_cooldowns.find_one({"emergency_device_id": normalized_id})
+        last_alert_at = existing["last_alert_at"] if existing else now
+        if isinstance(last_alert_at, str):
+            last_alert_at = datetime.fromisoformat(last_alert_at)
+        elapsed_ms = (now - last_alert_at).total_seconds() * 1000
+        remaining_seconds = max(1, int((cooldown_ms - elapsed_ms) / 1000))
+        raise HTTPException(
+            status_code=429,
+            detail=f"Please wait {remaining_seconds} more second(s) before sending another alert.",
+        )
+
+    alert = EmergencyAlert(emergency_device_id=normalized_id, alert_type="nearby_riders", location=request.location)
+    await db.emergency_alerts.insert_one(alert.dict())
+
+    min_lat, max_lat, min_lon, max_lon = bounding_box(
+        request.location.latitude, request.location.longitude, NEARBY_RIDER_RADIUS_MILES
+    )
+
+    # Only rows with both emergency_device_id and token_hash are enrolled/claimable; this
+    # also excludes legacy rows (see startup cleanup) whose stored location may be stale.
+    nearby_settings = await db.emergency_settings.find(
+        {
+            "emergency_device_id": {"$exists": True, "$ne": normalized_id},
+            "token_hash": {"$exists": True, "$ne": None},
+            "location_sharing_enabled": True,
+            "allow_notifications": True,
+            "last_known_location": {"$ne": None},
+            "last_known_location.latitude": {"$gte": min_lat, "$lte": max_lat},
+            "last_known_location.longitude": {"$gte": min_lon, "$lte": max_lon},
+        }
+    ).to_list(1000)
+
+    alerted_count = 0
+    for other in nearby_settings:
+        location = other.get("last_known_location")
+        if not location:
+            continue
+        distance_miles = haversine_distance_miles(
+            request.location.latitude,
+            request.location.longitude,
+            location["latitude"],
+            location["longitude"],
+        )
+        if distance_miles <= NEARBY_RIDER_RADIUS_MILES:
+            alerted_count += 1
+
+    return AlertNearbyRidersResponse(
+        success=True,
+        message=(
+            f"{alerted_count} nearby rider(s) in range. "
+            "This is an unverified report — always call 911 for emergencies."
+        ),
+        alerted_count=alerted_count,
+        alert_id=alert.id,
+    )
+
+
 @api_router.post("/status", response_model=StatusCheck)
 async def create_status_check(input: StatusCheckCreate):
     status_dict = input.dict()
@@ -877,6 +1397,138 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+def _operation_failure_matches(exc: OperationFailure, code: int, code_name: str, message_substring: str) -> bool:
+    """True if `exc` matches a specific MongoDB failure identified by `code`/`codeName`.
+    mongomock-motor (used in tests) raises OperationFailure for the same situations but
+    often without a code/codeName, so fall back to sniffing `message_substring` in the
+    error text in that case."""
+    error_code = getattr(exc, "code", None)
+    if error_code is not None:
+        return error_code == code
+
+    error_code_name = getattr(exc, "codeName", None)
+    details = getattr(exc, "details", None)
+    details_code_name = details.get("codeName") if isinstance(details, dict) else None
+    if error_code_name is not None or details_code_name is not None:
+        return code_name in (error_code_name, details_code_name)
+    return message_substring in str(exc).lower()
+
+
+def _is_index_not_found_error(exc: OperationFailure) -> bool:
+    """True if `exc` represents MongoDB's "index not found" failure, which is safe to
+    ignore when dropping a legacy index."""
+    return _operation_failure_matches(exc, 27, "IndexNotFound", "index not found")
+
+
+def _is_index_options_conflict_error(exc: OperationFailure) -> bool:
+    """True if `exc` represents MongoDB's "index already exists with different options"
+    failure, e.g. when a TTL index's expireAfterSeconds changed between deploys."""
+    return _operation_failure_matches(exc, 85, "IndexOptionsConflict", "already exists with different options")
+
+
+async def _ensure_ttl_index(collection, field: str, name: str, expire_after_seconds: int, max_attempts: int = 3):
+    """Idempotently create a TTL index, tolerating an existing index of the same name
+    with different options (e.g. a different retention window from an earlier deploy, or
+    another instance racing to apply the same migration concurrently) by dropping and
+    recreating it. Bounded retries instead of raising on conflict/race failures here:
+    unlike the legacy cooldown index (which must be gone for correctness), a TTL
+    retention window is not safety-critical, so we log and move on rather than aborting
+    startup if we can't converge it within a few attempts."""
+    kwargs = {"name": name, "expireAfterSeconds": expire_after_seconds}
+    for attempt in range(max_attempts):
+        try:
+            await collection.create_index(field, **kwargs)
+            return
+        except OperationFailure as exc:
+            if not _is_index_options_conflict_error(exc):
+                raise
+            if attempt < max_attempts - 1:
+                try:
+                    await collection.drop_index(name)
+                except OperationFailure as drop_exc:
+                    if not _is_index_not_found_error(drop_exc):
+                        raise
+                # Dropped (or it was already gone). A brief, jittered backoff before retrying
+                # reduces the chance that two instances racing to converge this index keep
+                # colliding with each other on every attempt.
+                await asyncio.sleep(random.uniform(0.05, 0.2))
+    logger.warning(
+        "Could not converge TTL index %r on %s to expireAfterSeconds=%s after %d attempt(s); "
+        "leaving whatever index currently exists in place.",
+        name, field, expire_after_seconds, max_attempts,
+    )
+
+
+@app.on_event("startup")
+async def create_indexes():
+    # Safely drop legacy unique index on device_id from PR #29 if present.
+    # New cooldown documents are keyed by emergency_device_id and omit device_id;
+    # a pre-existing unique index on device_id treats missing values as null and
+    # causes duplicate key errors (and false 429s) for subsequent riders.
+    cooldown_indexes = await db.emergency_alert_cooldowns.index_information()
+    if "device_id_1" in cooldown_indexes:
+        try:
+            await db.emergency_alert_cooldowns.drop_index("device_id_1")
+        except OperationFailure as exc:
+            if not _is_index_not_found_error(exc):
+                # Anything other than "already gone" means the stale unique index may
+                # still be in place; fail startup loudly instead of silently running
+                # with it (which would cause false 429 "please wait" responses).
+                logger.error("Failed to drop legacy cooldown index device_id_1: %s", exc)
+                raise
+            # Index was already dropped (e.g. concurrently by another instance); ignore.
+
+    # Legacy cooldown documents created before PR #33 only have `device_id`, not
+    # `emergency_device_id`. A non-sparse unique index on `emergency_device_id` treats
+    # every missing value as null, so two or more such legacy rows collide and the
+    # create_index call below raises DuplicateKeyError, aborting startup. Cooldowns are
+    # short-lived (minutes), so it's safe to simply delete legacy rows that predate the
+    # new field; this also keeps the migration idempotent (no-op on later runs). Run
+    # unconditionally (not gated on device_id_1 above) since legacy rows can exist even
+    # if that index was already dropped in an earlier deploy.
+    await db.emergency_alert_cooldowns.delete_many({"emergency_device_id": {"$exists": False}})
+
+    # Unique index backing the atomic upsert used to guard the nearby-riders alert cooldown.
+    await db.emergency_alert_cooldowns.delete_many(
+        {"emergency_device_id": {"$exists": False}}
+    )
+    await db.emergency_alert_cooldowns.create_index("emergency_device_id", unique=True)
+    # Unique (sparse) index backing the atomic $setOnInsert upsert used for emergency
+    # device enrollment. Sparse so legacy rows that predate emergency_device_id (see the
+    # purge below) — which all lack the field — never collide under the uniqueness
+    # constraint.
+    await db.emergency_settings.create_index("emergency_device_id", unique=True, sparse=True)
+    # Legacy emergency_settings rows created before per-device auth have no
+    # emergency_device_id/token_hash and can never be claimed or authenticated against by
+    # the endpoints above (see verify_device/enroll_or_verify). Their last_known_location
+    # is therefore unreachable by its original owner and must not be used for nearby-rider
+    # matching, so purge it here. Idempotent and safe to run on every startup.
+    await db.emergency_settings.update_many(
+        {"emergency_device_id": {"$exists": False}},
+        {"$unset": {"last_known_location": ""}},
+    )
+
+    # TTL index so unauthenticated call-for-help rows (see call_for_help) and other
+    # emergency_alerts rows don't accumulate forever. EmergencyAlert.timestamp is a real
+    # datetime (required by TTL indexes). _ensure_ttl_index handles a pre-existing index
+    # of the same name with different options (e.g. a different retention window from an
+    # earlier deploy, or a concurrently-starting instance) without crashing startup.
+    await _ensure_ttl_index(
+        db.emergency_alerts, "timestamp", "timestamp_ttl", EMERGENCY_ALERT_RETENTION_SECONDS
+    )
+
+    # One state per device makes the call-for-help throttle safe under concurrent requests.
+    await db.emergency_call_throttles.create_index(
+        "emergency_device_id", unique=True, name="emergency_device_id_1"
+    )
+    await _ensure_ttl_index(
+        db.emergency_call_throttles,
+        "timestamp",
+        "timestamp_ttl",
+        EMERGENCY_ALERT_RETENTION_SECONDS,
+    )
+
 
 @app.on_event("shutdown")
 async def shutdown_db_client():

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Text,
   View,
@@ -12,43 +12,22 @@ import {
   Share,
   TextInput,
   Modal,
+  InteractionManager,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
+import {
+  deleteCalculationLocally,
+  fetchJsonWithBackend,
+  getDeviceId,
+  isBackendConfigured,
+  listSavedCalculationsLocally,
+  lookupSharedCalculationLocally,
+  SavedCalculation,
+} from '@/lib/appSupport';
 
-const EXPO_PUBLIC_BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL;
 const { width } = Dimensions.get('window');
-
-interface SavedCalculation {
-  id: string;
-  name: string;
-  description?: string;
-  calculation: {
-    input_data: {
-      ramp_angle: number;
-      gap_distance: number;
-      bike_weight: number;
-      rider_weight: number;
-      unit_system: string;
-    };
-    required_speed_mph: number;
-    required_speed_kph: number;
-    safety_speed_mph: number;
-    safety_speed_kph: number;
-    flight_time_seconds: number;
-    max_height_feet: number;
-    max_height_meters: number;
-  };
-  location?: {
-    latitude: number;
-    longitude: number;
-    address?: string;
-  };
-  is_shared: boolean;
-  share_code?: string;
-  created_at: string;
-}
 
 export default function SavedScreen() {
   const [calculations, setCalculations] = useState<SavedCalculation[]>([]);
@@ -58,29 +37,56 @@ export default function SavedScreen() {
   const [isLookingUp, setIsLookingUp] = useState(false);
   const [showLookupModal, setShowLookupModal] = useState(false);
   const [selectedCalc, setSelectedCalc] = useState<SavedCalculation | null>(null);
+  const isMountedRef = useRef(true);
 
-  const fetchCalculations = async () => {
+  const fetchCalculations = useCallback(async () => {
     try {
-      const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/saved-calculations`);
-      if (!response.ok) throw new Error('Failed to fetch calculations');
-      const data = await response.json();
+      let data: SavedCalculation[];
+      const deviceId = await getDeviceId();
+
+      if (isBackendConfigured) {
+        try {
+          data = await fetchJsonWithBackend<SavedCalculation[]>(
+            `/api/saved-calculations?device_id=${encodeURIComponent(deviceId)}`
+          );
+        } catch {
+          data = await listSavedCalculationsLocally();
+        }
+      } else {
+        data = await listSavedCalculationsLocally();
+      }
+
+      if (!isMountedRef.current) {
+        return;
+      }
+
       setCalculations(data);
     } catch (error) {
       console.error('Error fetching calculations:', error);
     } finally {
-      setIsLoading(false);
-      setRefreshing(false);
+      if (isMountedRef.current) {
+        setIsLoading(false);
+        setRefreshing(false);
+      }
     }
-  };
+  }, []);
 
   useEffect(() => {
-    fetchCalculations();
-  }, []);
+    isMountedRef.current = true;
+    const task = InteractionManager.runAfterInteractions(() => {
+      void fetchCalculations();
+    });
+
+    return () => {
+      task.cancel();
+      isMountedRef.current = false;
+    };
+  }, [fetchCalculations]);
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
-    fetchCalculations();
-  }, []);
+    void fetchCalculations();
+  }, [fetchCalculations]);
 
   const handleDelete = async (id: string, name: string) => {
     Alert.alert(
@@ -93,12 +99,23 @@ export default function SavedScreen() {
           style: 'destructive',
           onPress: async () => {
             try {
-              const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/saved-calculation/${id}`, {
-                method: 'DELETE',
-              });
-              if (!response.ok) throw new Error('Failed to delete');
+              const deviceId = await getDeviceId();
+              if (isBackendConfigured) {
+                try {
+                  await fetchJsonWithBackend(
+                    `/api/saved-calculation/${id}?device_id=${encodeURIComponent(deviceId)}`,
+                    {
+                    method: 'DELETE',
+                    }
+                  );
+                } catch {
+                  await deleteCalculationLocally(id);
+                }
+              } else {
+                await deleteCalculationLocally(id);
+              }
               setCalculations(calculations.filter(c => c.id !== id));
-            } catch (error) {
+            } catch {
               Alert.alert('Error', 'Failed to delete calculation');
             }
           },
@@ -108,24 +125,48 @@ export default function SavedScreen() {
   };
 
   const handleShare = async (calc: SavedCalculation) => {
+    if (!isBackendConfigured) {
+      await shareCalculationDetails(calc);
+      return;
+    }
+
     if (calc.share_code) {
       // Already shared, just share the code
       await shareCode(calc);
     } else {
       // Generate share code first
       try {
-        const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/share-calculation/${calc.id}`, {
-          method: 'POST',
-        });
-        if (!response.ok) throw new Error('Failed to share');
-        const data = await response.json();
-        calc.share_code = data.share_code;
+        const deviceId = await getDeviceId();
+        const data = await fetchJsonWithBackend<{ share_code: string }>(
+          `/api/share-calculation/${calc.id}?device_id=${encodeURIComponent(deviceId)}`,
+          {
+            method: 'POST',
+          }
+        );
+        const sharedCalculation = {
+          ...calc,
+          share_code: data.share_code,
+          is_shared: true,
+        };
+
+        calc.share_code = sharedCalculation.share_code;
         calc.is_shared = true;
         setCalculations([...calculations]);
         await shareCode(calc);
-      } catch (error) {
+      } catch {
         Alert.alert('Error', 'Failed to generate share code');
       }
+    }
+  };
+
+  const shareCalculationDetails = async (calc: SavedCalculation) => {
+    const isMetric = calc.calculation.input_data.unit_system === 'metric';
+    try {
+      await Share.share({
+        message: `Dirt bike jump: "${calc.name}"\n\nRequired Speed: ${isMetric ? calc.calculation.required_speed_kph : calc.calculation.required_speed_mph} ${isMetric ? 'km/h' : 'mph'}\nSafe Speed: ${isMetric ? calc.calculation.safety_speed_kph : calc.calculation.safety_speed_mph} ${isMetric ? 'km/h' : 'mph'}\nGap: ${calc.calculation.input_data.gap_distance} ${isMetric ? 'm' : 'ft'}\nRamp Height: ${calc.calculation.input_data.ramp_height} ${isMetric ? 'm' : 'ft'}\nLanding Height Diff: ${calc.calculation.input_data.landing_height} ${isMetric ? 'm' : 'ft'}\nAngle: ${calc.calculation.input_data.ramp_angle}°\n${calc.location?.address ? `Location: ${calc.location.address}` : ''}`,
+      });
+    } catch (error) {
+      console.log('Error sharing:', error);
     }
   };
 
@@ -148,15 +189,28 @@ export default function SavedScreen() {
 
     setIsLookingUp(true);
     try {
-      const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/shared/${lookupCode.toUpperCase()}`);
-      if (!response.ok) {
+      let data: SavedCalculation | null;
+
+      if (isBackendConfigured) {
+        try {
+          data = await fetchJsonWithBackend<SavedCalculation>(
+            `/api/shared/${lookupCode.toUpperCase()}`
+          );
+        } catch {
+          data = await lookupSharedCalculationLocally(lookupCode);
+        }
+      } else {
+        data = await lookupSharedCalculationLocally(lookupCode);
+      }
+
+      if (!data) {
         throw new Error('Calculation not found');
       }
-      const data = await response.json();
+
       setSelectedCalc(data);
       setShowLookupModal(false);
       setLookupCode('');
-    } catch (error) {
+    } catch {
       Alert.alert('Not Found', 'No calculation found with that share code.');
     } finally {
       setIsLookingUp(false);

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Text,
   View,
@@ -9,29 +9,22 @@ import {
   ScrollView,
   RefreshControl,
   Modal,
+  InteractionManager,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
 import * as Location from 'expo-location';
-import Svg, { Circle, Path, G, Text as SvgText, Rect, Line } from 'react-native-svg';
+import Svg, { Circle, G, Text as SvgText, Rect, Line } from 'react-native-svg';
+import {
+  fetchJsonWithBackend,
+  getDeviceId,
+  isBackendConfigured,
+  listMapLocationsLocally,
+  MapLocation,
+} from '@/lib/appSupport';
 
-const EXPO_PUBLIC_BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL;
-const { width, height } = Dimensions.get('window');
-
-interface MapLocation {
-  id: string;
-  name: string;
-  latitude: number;
-  longitude: number;
-  address?: string;
-  is_shared: boolean;
-  share_code?: string;
-  required_speed_mph: number;
-  gap_distance: number;
-  ramp_angle: number;
-  created_at: string;
-}
+const { width } = Dimensions.get('window');
 
 export default function MapScreen() {
   const [locations, setLocations] = useState<MapLocation[]>([]);
@@ -41,12 +34,29 @@ export default function MapScreen() {
   const [selectedLocation, setSelectedLocation] = useState<MapLocation | null>(null);
   const [mapCenter, setMapCenter] = useState<{ lat: number; lng: number }>({ lat: 39.8283, lng: -98.5795 }); // US center
   const [mapZoom, setMapZoom] = useState(4);
+  const isMountedRef = useRef(true);
 
-  const fetchLocations = async () => {
+  const fetchLocations = useCallback(async () => {
     try {
-      const response = await fetch(`${EXPO_PUBLIC_BACKEND_URL}/api/map-locations`);
-      if (!response.ok) throw new Error('Failed to fetch locations');
-      const data = await response.json();
+      let data: MapLocation[];
+      const deviceId = await getDeviceId();
+
+      if (isBackendConfigured) {
+        try {
+          data = await fetchJsonWithBackend<MapLocation[]>(
+            `/api/map-locations?device_id=${encodeURIComponent(deviceId)}`
+          );
+        } catch {
+          data = await listMapLocationsLocally();
+        }
+      } else {
+        data = await listMapLocationsLocally();
+      }
+
+      if (!isMountedRef.current) {
+        return;
+      }
+
       setLocations(data);
       
       // Center map on locations if available
@@ -58,16 +68,22 @@ export default function MapScreen() {
     } catch (error) {
       console.error('Error fetching locations:', error);
     } finally {
-      setIsLoading(false);
-      setRefreshing(false);
+      if (isMountedRef.current) {
+        setIsLoading(false);
+        setRefreshing(false);
+      }
     }
-  };
+  }, []);
 
-  const getUserLocation = async () => {
+  const getUserLocation = useCallback(async () => {
     const { status } = await Location.requestForegroundPermissionsAsync();
     if (status === 'granted') {
       try {
         const location = await Location.getCurrentPositionAsync({});
+        if (!isMountedRef.current) {
+          return;
+        }
+
         setUserLocation({
           latitude: location.coords.latitude,
           longitude: location.coords.longitude,
@@ -81,17 +97,25 @@ export default function MapScreen() {
         console.log('Error getting location:', error);
       }
     }
-  };
+  }, []);
 
   useEffect(() => {
-    getUserLocation();
-    fetchLocations();
-  }, []);
+    isMountedRef.current = true;
+    const task = InteractionManager.runAfterInteractions(() => {
+      void getUserLocation();
+      void fetchLocations();
+    });
+
+    return () => {
+      task.cancel();
+      isMountedRef.current = false;
+    };
+  }, [fetchLocations, getUserLocation]);
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
-    fetchLocations();
-  }, []);
+    void fetchLocations();
+  }, [fetchLocations]);
 
   const formatDate = (dateString: string) => {
     const date = new Date(dateString);

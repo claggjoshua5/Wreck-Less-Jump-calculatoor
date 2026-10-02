@@ -7,24 +7,19 @@ import {
   ScrollView,
   Dimensions,
   Alert,
-  ActivityIndicator,
   Image,
-  Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
 import { Accelerometer } from 'expo-sensors';
 import * as ImagePicker from 'expo-image-picker';
-import Svg, { Circle, Line, Rect } from 'react-native-svg';
-import ARMeasureView from '../../components/ARMeasureView';
+import Svg, { Circle, Line } from 'react-native-svg';
 
 const { width } = Dimensions.get('window');
 
 // Credit card standard dimensions in inches
 const CREDIT_CARD_WIDTH_INCHES = 3.370;
-const CREDIT_CARD_HEIGHT_INCHES = 2.125;
-
 interface MeasurementPoint {
   x: number;
   y: number;
@@ -37,11 +32,10 @@ interface Measurements {
   landingHeight: number | null;
 }
 
-type MeasureMode = 'ar' | 'sensor' | 'photo';
+type MeasureMode = 'sensor' | 'photo';
 
 export default function MeasureScreen() {
-  // Mode state
-  const [mode, setMode] = useState<MeasureMode>('ar');
+  const [mode, setMode] = useState<MeasureMode>('sensor');
 
   // Angle measurement states
   const [isCalibrating, setIsCalibrating] = useState(false);
@@ -165,13 +159,6 @@ export default function MeasureScreen() {
     if (!measurementMode || !imageSize) return;
 
     const { locationX, locationY } = event.nativeEvent;
-    const displayWidth = width - 40;
-    const displayHeight = (displayWidth / imageSize.width) * imageSize.height;
-    
-    // Scale coordinates to actual image size
-    const scaleX = imageSize.width / displayWidth;
-    const scaleY = imageSize.height / displayHeight;
-    
     const point: MeasurementPoint = {
       x: locationX,
       y: locationY,
@@ -240,17 +227,6 @@ export default function MeasureScreen() {
     setMeasurePoints([]);
     setPixelsPerInch(null);
     setMeasurementMode(null);
-  };
-
-  // AR measurement callback
-  const handleARMeasurement = (type: 'rampAngle' | 'rampHeight' | 'gapDistance', value: number) => {
-    if (type === 'rampAngle') {
-      setMeasurements(prev => ({ ...prev, rampAngle: value }));
-    } else if (type === 'rampHeight') {
-      setMeasurements(prev => ({ ...prev, rampHeight: value }));
-    } else if (type === 'gapDistance') {
-      setMeasurements(prev => ({ ...prev, gapDistance: value }));
-    }
   };
 
   const getModeInstructions = () => {
@@ -339,13 +315,6 @@ export default function MeasureScreen() {
         {/* Mode Selector */}
         <View style={styles.modeSelector}>
           <TouchableOpacity
-            style={[styles.modeTab, mode === 'ar' && styles.modeTabActive]}
-            onPress={() => setMode('ar')}
-          >
-            <Ionicons name="scan" size={18} color={mode === 'ar' ? '#fff' : '#888'} />
-            <Text style={[styles.modeTabText, mode === 'ar' && styles.modeTabTextActive]}>AR</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
             style={[styles.modeTab, mode === 'sensor' && styles.modeTabActive]}
             onPress={() => setMode('sensor')}
           >
@@ -360,16 +329,6 @@ export default function MeasureScreen() {
             <Text style={[styles.modeTabText, mode === 'photo' && styles.modeTabTextActive]}>Photo</Text>
           </TouchableOpacity>
         </View>
-
-        {/* AR Mode */}
-        {mode === 'ar' && (
-          <View style={styles.section}>
-            <ARMeasureView
-              onMeasurement={handleARMeasurement}
-              onClose={() => setMode('sensor')}
-            />
-          </View>
-        )}
 
         {/* Sensor Mode - Angle Measurement */}
         {mode === 'sensor' && (
@@ -481,7 +440,7 @@ export default function MeasureScreen() {
                 />
                 <Text style={[
                   styles.calibrationText,
-                  pixelsPerInch && styles.calibrationTextActive
+                  pixelsPerInch ? styles.calibrationTextActive : null
                 ]}>
                   {pixelsPerInch ? 'Credit card calibrated' : 'Mark credit card edges'}
                 </Text>
@@ -511,7 +470,7 @@ export default function MeasureScreen() {
                   ]}
                   onPress={() => startMeasurement('gap')}
                 >
-                  <Ionicons name="resize-horizontal" size={18} color="#fff" />
+                  <Ionicons name="resize" size={18} color="#fff" />
                   <Text style={styles.measureButtonText}>
                     {measurements.gapDistance !== null ? `${measurements.gapDistance} ft` : 'Gap Distance'}
                   </Text>
@@ -750,6 +709,29 @@ const styles = StyleSheet.create({
     color: '#4CAF50',
     fontSize: 14,
     fontWeight: '600',
+  },
+  arUnavailable: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 32,
+    paddingHorizontal: 20,
+    borderRadius: 16,
+    backgroundColor: '#181818',
+    borderWidth: 1,
+    borderColor: '#2A2A2A',
+    gap: 8,
+  },
+  arUnavailableTitle: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: '700',
+    textAlign: 'center',
+  },
+  arUnavailableText: {
+    color: '#aaa',
+    fontSize: 14,
+    textAlign: 'center',
+    lineHeight: 20,
   },
   photoContainer: {
     marginTop: 8,
