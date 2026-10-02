@@ -23,6 +23,10 @@ const MapIcon = ({ color, size }: TabIconProps) => (
   <Ionicons name="map" size={size} color={color} />
 );
 
+const EmergencyIcon = ({ color, size }: TabIconProps) => (
+  <Ionicons name="heart" size={size} color={color} />
+);
+
 export default function TabLayout() {
   const { isSubscribed, isLoading, isTrial, trialInfo } = useSubscription();
 
@@ -99,6 +103,13 @@ export default function TabLayout() {
           options={{
             title: 'Map',
             tabBarIcon: MapIcon,
+          }}
+        />
+        <Tabs.Screen
+          name="emergency-settings"
+          options={{
+            title: 'Emergency',
+            tabBarIcon: EmergencyIcon,
           }}
         />
       </Tabs>

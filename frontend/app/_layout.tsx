@@ -1,13 +1,18 @@
 import React, { useState, useEffect, useCallback, useRef, createContext, useContext } from 'react';
 import { Stack } from 'expo-router';
-import { InteractionManager } from 'react-native';
+import { AppState, InteractionManager } from 'react-native';
+import * as Location from 'expo-location';
 import {
   fetchJsonWithBackend,
   getDeviceId,
+  getEmergencySettings,
   isBackendConfigured,
   isPaywallEnabled,
   TrialInfo,
+  updateEmergencySettings,
 } from '@/lib/appSupport';
+
+const EMERGENCY_LOCATION_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 
 interface SubscriptionContextType {
   isSubscribed: boolean;
@@ -41,6 +46,8 @@ export default function RootLayout() {
   const [trialInfo, setTrialInfo] = useState<TrialInfo | null>(null);
   const [statusMessage, setStatusMessage] = useState('');
   const isMountedRef = useRef(true);
+  const lastEmergencyLocationSyncAtRef = useRef(0);
+  const emergencyLocationSyncInProgressRef = useRef(false);
 
   const checkSubscription = useCallback(async () => {
     try {
@@ -99,6 +106,67 @@ export default function RootLayout() {
       setIsLoading(false);
     }
   }, []);
+
+  const syncEmergencyLocation = useCallback(async () => {
+    const now = Date.now();
+    if (
+      AppState.currentState !== 'active' ||
+      now - lastEmergencyLocationSyncAtRef.current < EMERGENCY_LOCATION_SYNC_INTERVAL_MS ||
+      emergencyLocationSyncInProgressRef.current
+    ) {
+      return;
+    }
+
+    lastEmergencyLocationSyncAtRef.current = now;
+    emergencyLocationSyncInProgressRef.current = true;
+    try {
+      const deviceId = await getDeviceId();
+      const settings = await getEmergencySettings(deviceId);
+      if (!settings.location_sharing_enabled) {
+        return;
+      }
+
+      const permission = await Location.getForegroundPermissionsAsync();
+      if (permission.status !== 'granted') {
+        return;
+      }
+
+      const current = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.Balanced,
+      });
+      if (AppState.currentState !== 'active') {
+        return;
+      }
+
+      await updateEmergencySettings(deviceId, {
+        location: {
+          latitude: current.coords.latitude,
+          longitude: current.coords.longitude,
+        },
+      });
+    } catch {
+      // Location refresh is best-effort; settings remain available offline.
+    } finally {
+      emergencyLocationSyncInProgressRef.current = false;
+    }
+  }, []);
+
+  useEffect(() => {
+    void syncEmergencyLocation();
+    const interval = setInterval(() => {
+      void syncEmergencyLocation();
+    }, EMERGENCY_LOCATION_SYNC_INTERVAL_MS);
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        void syncEmergencyLocation();
+      }
+    });
+
+    return () => {
+      clearInterval(interval);
+      subscription.remove();
+    };
+  }, [syncEmergencyLocation]);
 
   useEffect(() => {
     isMountedRef.current = true;
