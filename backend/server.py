@@ -177,6 +177,11 @@ class ShareCalculationRequest(BaseModel):
 # Emergency Alert Models
 DEFAULT_ALERT_COOLDOWN_MS = 5 * 60 * 1000  # 5 minutes
 NEARBY_RIDER_RADIUS_MILES = 5.0
+# How far the caller's alert-request location may drift from their own stored
+# last_known_location before it's rejected. Enrollment is free and unauthenticated, so
+# without this check anyone could sweep arbitrary coordinates through this endpoint to learn
+# where opted-in riders are, even though only a count is ever returned.
+NEARBY_ALERT_LOCATION_TOLERANCE_MILES = 1.0
 # Minimum time between two call-for-help rows logged for the same emergency_device_id.
 # This is a basic write throttle only (see call_for_help); real per-IP rate limiting
 # needs infrastructure (reverse proxy / middleware) and is out of scope here.
@@ -1142,29 +1147,40 @@ async def update_emergency_settings(
     normalized_id = require_emergency_device_id(emergency_device_id)
     existing = await enroll_or_verify(normalized_id, device_token)
 
-    settings = EmergencySettings(**existing)
+    # Build a targeted $set/$unset of only the fields this request changes, rather than
+    # reading the whole document, mutating a copy, and writing it all back. The latter lets
+    # two near-simultaneous updates (e.g. a location refresh and a toggle) silently clobber
+    # each other's fields; a targeted update_one is safe under concurrent requests.
+    set_fields: Dict = {"updated_at": datetime.utcnow()}
+    unset_fields: Dict = {}
 
     if update.allow_notifications is not None:
-        settings.allow_notifications = update.allow_notifications
+        set_fields["allow_notifications"] = update.allow_notifications
+
+    sharing_enabled = (
+        update.location_sharing_enabled
+        if update.location_sharing_enabled is not None
+        else existing.get("location_sharing_enabled", False)
+    )
 
     if update.location_sharing_enabled is not None:
-        settings.location_sharing_enabled = update.location_sharing_enabled
+        set_fields["location_sharing_enabled"] = update.location_sharing_enabled
         if not update.location_sharing_enabled:
-            settings.last_known_location = None
+            unset_fields["last_known_location"] = ""
 
-    if update.location is not None and settings.location_sharing_enabled:
-        settings.last_known_location = update.location
+    if update.location is not None and sharing_enabled and "last_known_location" not in unset_fields:
+        set_fields["last_known_location"] = update.location.dict()
 
-    settings.updated_at = datetime.utcnow()
+    mongo_update: Dict = {"$set": set_fields}
+    if unset_fields:
+        mongo_update["$unset"] = unset_fields
 
-    settings_data = settings.dict()
-    settings_data["token_hash"] = existing["token_hash"]
-    await db.emergency_settings.update_one(
+    updated = await db.emergency_settings.find_one_and_update(
         {"emergency_device_id": normalized_id},
-        {"$set": settings_data},
-        upsert=True,
+        mongo_update,
+        return_document=ReturnDocument.AFTER,
     )
-    return to_public(settings)
+    return to_public(EmergencySettings(**updated))
 
 
 @api_router.post("/emergency/call-for-help", response_model=CallForHelpResponse)
@@ -1289,6 +1305,37 @@ async def alert_nearby_riders(
             detail="Enable location sharing in emergency settings before alerting nearby riders.",
         )
 
+    # The caller's alert location must be near their OWN stored location, checked before the
+    # cooldown claim below so a rejected request never burns the cooldown. Enrollment is free
+    # and unauthenticated by design, so without this, anyone could sweep arbitrary coordinates
+    # through request.location to learn where opted-in riders are. The stored last_known_location
+    # (not the request-supplied one) is also used as the matching center below, so a spoofed
+    # request.location can't move the search area at all.
+    own_location = settings_doc.get("last_known_location")
+    if not own_location:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Enable location sharing and let the app update your location before "
+                "alerting nearby riders."
+            ),
+        )
+
+    distance_from_own_location = haversine_distance_miles(
+        request.location.latitude,
+        request.location.longitude,
+        own_location["latitude"],
+        own_location["longitude"],
+    )
+    if distance_from_own_location > NEARBY_ALERT_LOCATION_TOLERANCE_MILES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Your current location doesn't match your last shared location. "
+                "Open Emergency Settings to refresh it."
+            ),
+        )
+
     cooldown_ms = settings_doc.get("alert_cooldown_ms", DEFAULT_ALERT_COOLDOWN_MS)
 
     # Atomic upsert on a per-device cooldown record instead of check-then-insert, to avoid a
@@ -1324,7 +1371,7 @@ async def alert_nearby_riders(
     await db.emergency_alerts.insert_one(alert.dict())
 
     min_lat, max_lat, min_lon, max_lon = bounding_box(
-        request.location.latitude, request.location.longitude, NEARBY_RIDER_RADIUS_MILES
+        own_location["latitude"], own_location["longitude"], NEARBY_RIDER_RADIUS_MILES
     )
 
     # Only rows with both emergency_device_id and token_hash are enrolled/claimable; this
@@ -1347,8 +1394,8 @@ async def alert_nearby_riders(
         if not location:
             continue
         distance_miles = haversine_distance_miles(
-            request.location.latitude,
-            request.location.longitude,
+            own_location["latitude"],
+            own_location["longitude"],
             location["latitude"],
             location["longitude"],
         )
@@ -1490,9 +1537,6 @@ async def create_indexes():
     await db.emergency_alert_cooldowns.delete_many({"emergency_device_id": {"$exists": False}})
 
     # Unique index backing the atomic upsert used to guard the nearby-riders alert cooldown.
-    await db.emergency_alert_cooldowns.delete_many(
-        {"emergency_device_id": {"$exists": False}}
-    )
     await db.emergency_alert_cooldowns.create_index("emergency_device_id", unique=True)
     # Unique (sparse) index backing the atomic $setOnInsert upsert used for emergency
     # device enrollment. Sparse so legacy rows that predate emergency_device_id (see the
