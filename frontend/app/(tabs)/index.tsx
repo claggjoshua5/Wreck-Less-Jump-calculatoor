@@ -19,6 +19,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
+import { useRouter } from 'expo-router';
 import Svg, { Path, Circle, Line, Text as SvgText, G, Polygon } from 'react-native-svg';
 import * as Location from 'expo-location';
 import {
@@ -43,6 +44,7 @@ import {
 const { width } = Dimensions.get('window');
 
 export default function Index() {
+  const router = useRouter();
   // Input states
   const [rampHeight, setRampHeight] = useState('');
   const [rampAngle, setRampAngle] = useState('');
@@ -380,7 +382,11 @@ export default function Index() {
       if (!settings.location_sharing_enabled) {
         Alert.alert(
           'Location Sharing Required',
-          'Enable location sharing in Emergency Settings before alerting nearby riders. Your exact location is never broadcast — it is only used to privately check who is within 5 miles.'
+          'Enable location sharing in Emergency Settings before requesting a nearby-rider match. Your exact location is never shown to other riders.',
+          [
+            { text: 'Cancel', style: 'cancel' },
+            { text: 'Emergency Settings', onPress: () => router.push('/(tabs)/emergency-settings') },
+          ]
         );
         return;
       }
@@ -421,7 +427,7 @@ export default function Index() {
         await setLastNearbyAlertSentAt(Date.now());
         Alert.alert(
           'Backend Unavailable',
-          'Nearby riders could not be notified because the backend is not configured. Always call 911 directly for real emergencies.'
+          'Nearby-rider matching is unavailable because the backend is not configured. Always call 911 directly for real emergencies.'
         );
       }
     } catch (error: any) {
@@ -881,7 +887,7 @@ export default function Index() {
                   onPress={openAlertRidersModal}
                   disabled={isSendingAlert}
                   accessibilityRole="button"
-                  accessibilityLabel="Alert Nearby Riders. Notifies opted-in riders within 5 miles that help may be needed."
+                  accessibilityLabel="Request a nearby rider match. Riders are not notified because alert delivery is not available yet."
                 >
                   {isSendingAlert ? (
                     <ActivityIndicator color="#fff" />
@@ -1048,7 +1054,7 @@ export default function Index() {
             <Ionicons name="heart" size={40} color="#4CAF50" style={styles.confirmModalIcon} />
             <Text style={styles.confirmModalTitle}>Alert nearby riders?</Text>
             <Text style={styles.confirmModalBody}>
-              Other riders within 5 miles will be notified that help may be needed.
+              This requests a nearby-rider match. Alert delivery to other riders is not available yet, so no riders will be notified.
             </Text>
             <Text style={styles.confirmModalDisclaimer}>
               This is an unverified report. Always call 911 for emergencies.
